@@ -1,0 +1,57 @@
+[package]
+name = "ruspiro-vchiq"
+version = "0.0.1-alpha"
+authors = ["André Borrmann <pspwizard@gmx.de>"]
+license = "Apache-2.0"
+edition = "2018"
+publish = false
+readme = "README.md"
+description = """
+Bare Metal Library to interact with the VideoCore of the Raspberry Pi
+using the VCHIQ interface.
+"""
+exclude = [".travis.yml", "Makefile.toml"]
+
+[[bin]]
+name = "kernel"
+path = "./src/main.rs"
+
+[lib]
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+# get functions like memset, memcpy into the binary
+rlibc = "1.0.0"
+paste = "1.0.4"
+# core boot crate to run the bootstrapping for us
+ruspiro-boot = { version = "0.4.2" }#, features = ["multicore"] }
+ruspiro-arch-aarch64 = "0.1"
+ruspiro-mmio-register = "0.1"
+ruspiro-allocator = "0.4.2"
+ruspiro-mailbox = "0.4.0"
+ruspiro-mmu = "0.1.0"
+ruspiro-console = "0.4.1"
+ruspiro-uart = { path = "../ruspiro-uart" }
+ruspiro-lock = { version = "0.4.1", features = ["async_locks"] }
+ruspiro-singleton = "0.4.1"
+ruspiro-error = "0.1.0"
+ruspiro-brain = { path = "../ruspiro-brain" } #git = "https://github.com/RusPiRo/ruspiro-brain.git" }
+
+[features]
+default = ["ruspiro_pi3"]
+ruspiro_pi3 = [
+    "ruspiro-boot/ruspiro_pi3",
+    "ruspiro-mailbox/ruspiro_pi3",
+    "ruspiro-uart/ruspiro_pi3"
+]
+
+[patch.crates-io]
+ruspiro-allocator = { path = "../ruspiro-allocator" }
+ruspiro-interrupt = { path = "../ruspiro-interrupt" }
+ruspiro-timer = { path = "../ruspiro-timer" }
+ruspiro-gpio = { path = "../ruspiro-gpio" }
+ruspiro-boot = { path = "../ruspiro-boot" }
+ruspiro-mmu = { path = "../ruspiro-mmu" }
+ruspiro-lock = { path = "../ruspiro-lock", features = ["async_lock"] }
