@@ -10,12 +10,12 @@
 
 use super::config::*;
 use super::shared::FourCC;
-use ruspiro_lock::sync::{Mutex, Semaphore};
-use ruspiro_console::*;
-use alloc::sync::Arc;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};
+use ruspiro_console::*;
+use ruspiro_lock::sync::{Mutex, Semaphore};
 
 pub const VCHIQ_PORT_FREE: u32 = 0x1000;
 
@@ -23,7 +23,7 @@ pub const VCHIQ_PORT_FREE: u32 = 0x1000;
 pub static NEXT_SRV_HANDLE: AtomicU32 = AtomicU32::new(VCHIQ_MAX_SERVICES as u32);
 
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct ServiceHandle(pub u32);
 
 /// The different states a [Service] could be in.
@@ -144,12 +144,12 @@ impl Service {
 
 #[derive(Default, Debug)]
 pub struct ServiceQuota {
-    pub slot_quota: u32,
-    pub slot_use_count: u32,
-    pub message_quota: u32,
-    pub message_use_count: u32,
+    pub slot_quota: usize,
+    pub slot_use_count: usize,
+    pub message_quota: usize,
+    pub message_use_count: usize,
     pub quota_event: Semaphore,
-    pub previous_tx_index: i32,
+    pub previous_tx_index: isize,
 }
 
 #[derive(Default, Debug)]

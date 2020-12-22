@@ -8,15 +8,15 @@
 //! # VCHIQ Event
 //!
 
+use crate::doorbell::ring_vc_doorbell;
 use alloc::format;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use ruspiro_lock::sync::Semaphore;
-use crate::doorbell::ring_vc_doorbell;
 use ruspiro_arch_aarch64::instructions::*;
 use ruspiro_console::*;
+use ruspiro_lock::sync::Semaphore;
 
 /// Representation of a shared event that may be raised either from ARM or from VC side
 #[derive(Debug, Default)]
@@ -107,7 +107,7 @@ impl Future for EventAccessor<LocalEvent> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // check if the event has been fired. We need memory barriers to ensure actual data is read
         unsafe {
-            let accessor = self.get_mut();//unchecked_mut();
+            let accessor = self.get_mut(); //unchecked_mut();
             dmb();
             if accessor.fired() == 0 {
                 // it's not yet fired, so "arm" it to signal to the other side we would be ready for immediate handling

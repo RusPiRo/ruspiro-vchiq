@@ -13,7 +13,8 @@ The following list shall give an overview of the actual implementation state and
 - [x] VCHIQ Instance and global state initialization
 - [x] Initial Handshake from ARM to VC with the mailbox interface
 - [x] exchange VCHIQ Connect message btw. ARM and VC
-- [ ] implement service creation and opening
+- [x] implement service creation and opening
+- [ ] implement service closure
 - [ ] get usage of the *echo* service running and tested
 
 ## Build the Test Kernel
@@ -89,7 +90,7 @@ The first option to test the current implementation is to build the test kernel 
     Kernel file to send: ./target/kernel8.img with mode aarch64
     Send to port: COM3
     Send kernel to device. Initiate with token...
-    Device acknowledged. Send kernel size 156800
+    Device acknowledged. Send kernel size 144960
     Device acknowledged. Send kernel...
     Kernel successfully sent
     mirroring
@@ -100,54 +101,79 @@ The first option to test the current implementation is to build the test kernel 
     I: kernel - Brain starts thinking on core 0
     I: kernel - Run VCHIQ Test.....
     I: ruspiro_vchiq::instance - create VchiqInstance
-    I: ruspiro_vchiq::state - SharedMemory: 0xffffffffc00e8000 / 0xc00e8000 - size 266240
-    I: ruspiro_vchiq::shared::slot - set message in slot 33, base ptr 0xffffffffc00e8000, slot start ptr 0xffffffffc0109000
+    I: ruspiro_vchiq::state - SharedMemory: 0xffffffffc00e5000 / 0xc00e5000 - size 266240
+    I: ruspiro_vchiq::shared::slot - set message in slot 33, base ptr 0xffffffffc00e5000, slot start ptr 0xffffffffc0106000
     I: ruspiro_vchiq::instance - try to connect VchiqInstance
+    I: ruspiro_vchiq::state - queue message CONNECT
     I: ruspiro_vchiq::state - reserve space of 8 bytes from the slot  with 4096 bytes
     I: ruspiro_vchiq::state - Space reserved at SlotPosition(
         34,
         0,
     ) with size 8
-    I: ruspiro_vchiq::shared::slot - set message in slot 34, base ptr 0xffffffffc00e8000, slot start ptr 0xffffffffc010a000
+    I: ruspiro_vchiq::state - slot locked
+    I: ruspiro_vchiq::state - quota locked
+    I: ruspiro_vchiq::shared::slot - set message in slot 34, base ptr 0xffffffffc00e5000, slot start ptr 0xffffffffc0107000
     I: ruspiro_vchiq::state - prepare message: CONNECT, pos: SlotPosition(34, 0), size: 0
     I: ruspiro_vchiq::state - set local_tx_pos to 8
     I: ruspiro_vchiq::doorbell - VC doorbell rung
     I: ruspiro_vchiq::state - message queued and VC notified
     I: ruspiro_vchiq::state - update connection state
-    I: ruspiro_vchiq::state - change conn_state from DISCONNECTED to CONNECTING
-    I: ruspiro_vchiq::state - next stage
-    I: ruspiro_vchiq::state - VCHIQ in 'connecting' state
-    I: ruspiro_vchiq::state - slot_queue_index 0
-    I: ruspiro_vchiq::state - slot_index 2
-    I: ruspiro_vchiq::state - handle message from Some(SlotPosition(2, 0))
-    I: ruspiro_vchiq::state - slot header - message type CONNECT / size 0x0
-    I: ruspiro_vchiq::state - CONNECT - version common 8
-    I: ruspiro_vchiq::state - new rx_pos 8
-    I: ruspiro_vchiq::slothandler - wake slothandler by ref
-    I: ruspiro_vchiq::state - connect semaphore down
-    I: ruspiro_vchiq::state - change conn_state from CONNECTING to CONNECTED
+    I: ruspiro_vchiq::state - wait for VC CONNECT
+    I: ruspiro_vchiq::slothandler - slot_queue_index 0
+    I: ruspiro_vchiq::slothandler - slot_index 2
+    I: ruspiro_vchiq::slothandler - handle message from Some(SlotPosition(2, 0))
+    I: ruspiro_vchiq::slothandler - slot header - message type CONNECT / size 0x0
+    I: ruspiro_vchiq::slothandler - CONNECT - version common 8
+    I: ruspiro_vchiq::slothandler - new rx_pos 8
     I: ruspiro_vchiq::state - add new service 'echo' at index 0
     I: ruspiro_vchiq::service - set new state for service 'echo' FREE -> OPENING
+    I: ruspiro_vchiq::state - queue message OPEN
     I: ruspiro_vchiq::state - reserve space of 24 bytes from the slot  with 4088 bytes
     I: ruspiro_vchiq::state - Space reserved at SlotPosition(
         34,
         8,
     ) with size 24
-    I: ruspiro_vchiq::shared::slot - set message in slot 34, base ptr 0xffffffffc00e8000, slot start ptr 0xffffffffc010a000
+    I: ruspiro_vchiq::state - slot locked
+    I: ruspiro_vchiq::state - quota locked
+    I: ruspiro_vchiq::shared::slot - set message in slot 34, base ptr 0xffffffffc00e5000, slot start ptr 0xffffffffc0107000
     I: ruspiro_vchiq::state - prepare message: OPEN, pos: SlotPosition(34, 8), size: 12
     I: ruspiro_vchiq::state - copy message context
     I: ruspiro_vchiq::state - set local_tx_pos to 32
     I: ruspiro_vchiq::doorbell - VC doorbell rung
     I: ruspiro_vchiq::state - message queued and VC notified
     I: ruspiro_vchiq::state - waiting for OpenService ACK/NACK
-    I: ruspiro_vchiq::state - handle message from Some(SlotPosition(2, 8))
-    I: ruspiro_vchiq::state - slot header - message type OPENACK / size 0x2
-    I: ruspiro_vchiq::state - Message: OpenAckPayload { version: 3 }
+    I: ruspiro_vchiq::slothandler - handle message from Some(SlotPosition(2, 8))
+    I: ruspiro_vchiq::slothandler - slot header - message type OPENACK / size 0x2
+    I: ruspiro_vchiq::slothandler - Message: OpenAckPayload { version: 3 }
     I: ruspiro_vchiq::service - set new state for service 'echo' OPENING -> OPEN
-    I: ruspiro_vchiq::state - new rx_pos 24
-    I: ruspiro_vchiq::slothandler - wake slothandler by ref
+    I: ruspiro_vchiq::slothandler - new rx_pos 24
     I: ruspiro_vchiq::state - Service state: OPEN
     I: kernel - Service ServiceHandle(4096) opened
+    I: ruspiro_vchiq::state - closing service w. local port 0
+    I: ruspiro_vchiq::state - queue message CLOSE
+    I: ruspiro_vchiq::state - reserve space of 8 bytes from the slot  with 4064 bytes
+    I: ruspiro_vchiq::state - Space reserved at SlotPosition(
+        34,
+        32,
+    ) with size 8
+    I: ruspiro_vchiq::state - slot locked
+    I: ruspiro_vchiq::state - quota locked
+    I: ruspiro_vchiq::shared::slot - set message in slot 34, base ptr 0xffffffffc00e5000, slot start ptr 0xffffffffc0107000
+    I: ruspiro_vchiq::state - prepare message: CLOSE, pos: SlotPosition(34, 32), size: 0
+    I: ruspiro_vchiq::state - set local_tx_pos to 40
+    I: ruspiro_vchiq::state - set state CLOSESENT
+    I: ruspiro_vchiq::service - set new state for service 'echo' OPEN -> CLOSESENT
+    I: ruspiro_vchiq::doorbell - VC doorbell rung
+    I: ruspiro_vchiq::state - message queued and VC notified
+    I: ruspiro_vchiq::service - set new state for service 'echo' CLOSESENT -> CLOSESENT
+    I: ruspiro_vchiq::slothandler - handle message from Some(SlotPosition(2, 24))
+    I: ruspiro_vchiq::slothandler - slot header - message type CLOSE / size 0x0
+    I: ruspiro_vchiq::slothandler - close service with state CLOSESENT
+    I: ruspiro_vchiq::service - set new state for service 'echo' CLOSESENT -> CLOSED
+    I: ruspiro_vchiq::state - free service
+    I: ruspiro_vchiq::service - set new state for service 'echo' CLOSED -> FREE
+    I: ruspiro_vchiq::slothandler - new rx_pos 32
+    I: kernel - Service closed
     I: kernel - Test finished
     I: ruspiro_vchiq::instance - dropping VCHIQ
     ```

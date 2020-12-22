@@ -37,7 +37,8 @@ ruspiro-uart = { path = "../ruspiro-uart" }
 ruspiro-lock = { version = "0.4.1", features = ["async_locks"] }
 ruspiro-singleton = "0.4.1"
 ruspiro-error = "0.1.0"
-ruspiro-brain = { path = "../ruspiro-brain" } #git = "https://github.com/RusPiRo/ruspiro-brain.git" }
+ruspiro-brain = { git = "https://github.com/RusPiRo/ruspiro-brain.git", branch = "development" }
+ruspiro-interrupt = "0.3"
 
 [features]
 default = ["ruspiro_pi3"]

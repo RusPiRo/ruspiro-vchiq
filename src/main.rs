@@ -20,11 +20,12 @@ extern crate ruspiro_allocator;
 
 mod panic;
 
+use ruspiro_brain::*;
+use ruspiro_console::*;
+use ruspiro_interrupt::*;
 use ruspiro_mailbox::Mailbox;
 use ruspiro_mmu as mmu;
-use ruspiro_console::*;
 use ruspiro_uart::*;
-use ruspiro_brain::*;
 use ruspiro_vchiq as vchiq;
 
 come_alive_with!(alive);
@@ -54,6 +55,10 @@ pub fn alive(core: u32) {
             CONSOLE.with_mut(|cons| cons.replace(uart));
         }
 
+        // initialize the interrupt manager
+        IRQ_MANAGER.with_mut(|irq| irq.initialize());
+        enable_interrupts();
+
         info!("VCHIQ Testkernel is alive....");
         // initialize the brain
         BRAIN.lock().init();
@@ -67,7 +72,6 @@ pub fn alive(core: u32) {
 /// intended to never return as the core does not have anything todo if this processing finishes. So the `run` function
 /// represents the runtime of the OS on each core.
 pub fn run(core: u32) -> ! {
-
     info!("Brain starts thinking on core {}", core);
     // once the next core has been kicked off we can start the Brain to pick up it's work and to enable async
     // functions beeing first class citicen in the NapuliOS
@@ -79,18 +83,25 @@ pub fn run(core: u32) -> ! {
 
 async fn test_vchiq() {
     info!("Run VCHIQ Test.....");
-    let mut vchiq = vchiq::instance::VchiqInstance::new().await.unwrap();
-    vchiq.connect().await.unwrap();
+    let mut vchiq = vchiq::instance::VchiqInstance::new().unwrap();
+    vchiq
+        .connect()
+        .await
+        .map_err(|e| error!("{:?}", e))
+        .unwrap();
 
     let params = vchiq::service::ServiceParams {
         fourcc: b"echo".into(),
         callback: None,
         version: 3,
-        version_min: 3
+        version_min: 3,
     };
 
     let service_handle = vchiq.open_service(params).await.unwrap();
     info!("Service {:?} opened", service_handle);
-    
+
+    vchiq.close_service(service_handle).await.unwrap();
+    info!("Service closed");
+
     info!("Test finished");
 }

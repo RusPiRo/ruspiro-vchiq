@@ -18,6 +18,7 @@ extern crate rlibc;
 
 mod config;
 mod doorbell;
+pub mod error;
 pub mod instance;
 pub mod service;
 mod shared;

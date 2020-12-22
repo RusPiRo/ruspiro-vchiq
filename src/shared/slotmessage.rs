@@ -8,8 +8,8 @@
 //! # VCHIQ SlotMessage
 //!
 
-use core::mem;
 use alloc::vec::Vec;
+use core::mem;
 use ruspiro_error::{BoxError, Error, GenericError};
 
 /// The message ID of a padding message
@@ -32,7 +32,7 @@ pub struct SlotMessageHeader {
 }
 
 #[allow(non_camel_case_types, dead_code)]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(u32)]
 pub enum MessageType {
     PADDING = 0,            /* -                                 */
@@ -90,7 +90,7 @@ impl core::convert::TryFrom<SlotMessage<Vec<u8>>> for OpenAckPayload {
             //let msg = unsafe { core::ptr::read_volatile(msg_ptr as *const SlotMessage<OpenAckPayload>) };
             let data_ptr = message.data.as_ptr();
             let data = unsafe { core::ptr::read_volatile(data_ptr as *const OpenAckPayload) };
-            
+
             Ok(data)
         }
     }

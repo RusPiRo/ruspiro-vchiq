@@ -9,13 +9,16 @@
 //!
 use alloc::sync::Arc;
 
+use super::error::VchiqError;
 use super::service::*;
 use super::slothandler::slot_handler;
 use super::state::State;
 use super::VchiqResult;
+use crate::doorbell;
+use core::future::poll_fn;
 use ruspiro_brain::spawn;
-use ruspiro_error::{Error, GenericError, BoxError};
 use ruspiro_console::info;
+use ruspiro_error::{BoxError, Error, GenericError};
 
 pub struct VchiqInstance {
     state: Arc<State>,
@@ -25,12 +28,20 @@ pub struct VchiqInstance {
 }
 
 impl VchiqInstance {
-    pub async fn new() -> VchiqResult<Self> {
+    /// Create a new VCHIQ instance.
+    pub fn new() -> VchiqResult<Self> {
         info!("create VchiqInstance");
         let mut state = State::new()?;
-        state.initialize().await?;
+        state.initialize()?;
         let state = Arc::new(state);
-        spawn(slot_handler(Arc::clone(&state)));
+        // TODO: we might require a 'handle' to the future spawned here
+        // as this should be cleaned up once the VCHIQ instance is dropped. Otherwise
+        // this would never finish. Or we need to establish a channel between this instance
+        // and the slothandler future to notify it to be stopped
+        let state_clone = Arc::clone(&state);
+        spawn(poll_fn(move |cx| {
+            slot_handler(Arc::clone(&state_clone), cx)
+        }));
 
         Ok(Self {
             state,
@@ -38,10 +49,12 @@ impl VchiqInstance {
         })
     }
 
+    /// Connect the ARM side of the VCHIQ with the VideoCore side. This is a prerequisite for any further calls to
+    /// VCHIQ interface that requires both sides to be connected.
     pub async fn connect(&mut self) -> VchiqResult<()> {
         info!("try to connect VchiqInstance");
         if self.connected {
-            return Err(GenericError::with_message("Vchiq already connected").into());
+            return Err(VchiqError::AlreadyConnected.into());
         }
 
         self.state.connect().await?;
@@ -50,11 +63,13 @@ impl VchiqInstance {
         Ok(())
     }
 
+    /// Open a service between the ARM and the VideoCore side. A service is representing a specific "device" or function
+    /// of the VideoCore.
     pub async fn open_service(&mut self, params: ServiceParams) -> VchiqResult<ServiceHandle> {
         if self.connected {
             self.create_service(params, true).await
         } else {
-            Err(GenericError::with_message("Can't open service if not connected").into())
+            Err(VchiqError::NotConnected.into())
         }
     }
 
@@ -76,12 +91,17 @@ impl VchiqInstance {
         let srv_handle = self.state.add_service(params, srv_state).await?;
         if open {
             self.state.open_service(srv_handle).await.map_err(|e| {
-                self.state.remove_service(srv_handle);
+                //self.state.remove_service(srv_handle);
                 e
             })?;
         }
 
         Ok(srv_handle)
+    }
+
+    /// Close a previously opened service
+    pub async fn close_service(&mut self, service: ServiceHandle) -> VchiqResult<()> {
+        self.state.close_service(service).await
     }
 }
 

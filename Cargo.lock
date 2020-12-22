@@ -61,6 +61,7 @@ dependencies = [
 [[package]]
 name = "ruspiro-brain"
 version = "0.1.0"
+source = "git+https://github.com/RusPiRo/ruspiro-brain.git?branch=development#b7e22d751e6307b4bcaafa47b5adaa5e4ce8ae3f"
 dependencies = [
  "ruspiro-channel",
  "ruspiro-lock 0.4.1",
@@ -80,9 +81,9 @@ dependencies = [
 [[package]]
 name = "ruspiro-channel"
 version = "0.1.0"
-source = "git+https://github.com/RusPiRo/ruspiro-channel.git#fb140004c86f9403b4ce4a103f2f5af451a7fd87"
+source = "git+https://github.com/RusPiRo/ruspiro-channel.git#6203232e629c3ea9ded4137ab65526e96aa986bd"
 dependencies = [
- "ruspiro-lock 0.4.1",
+ "ruspiro-arch-aarch64",
 ]
 
 [[package]]
@@ -237,6 +238,7 @@ dependencies = [
  "ruspiro-brain",
  "ruspiro-console",
  "ruspiro-error",
+ "ruspiro-interrupt",
  "ruspiro-lock 0.4.1",
  "ruspiro-mailbox",
  "ruspiro-mmio-register",

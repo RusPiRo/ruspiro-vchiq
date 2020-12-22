@@ -8,37 +8,47 @@
 //! # VCHIQ State
 //!
 
-use alloc::alloc::{alloc, dealloc, Layout};
-use alloc::vec::Vec;
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use core::{
-    cmp, mem, ptr,
-    convert::{TryFrom, TryInto},
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll}
-};
 use super::config::*;
 use super::service::*;
-use super::shared::FourCC;
 use super::shared::fragment::Fragment;
 use super::shared::slot::{slot_queue_index_from_pos, Slot, SlotAccessor, SlotPosition};
 use super::shared::slotmessage::*;
+use super::shared::FourCC;
+use crate::{
+    doorbell,
+    error::VchiqError,
+    shared::slotzero::{SlotZero, SlotZeroAccessor},
+};
+use crate::{
+    service::{self, ServiceState},
+    VchiqResult,
+};
+use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::{
+    cell::{RefCell, RefMut},
+    cmp,
+    convert::{TryFrom, TryInto},
+    future::{poll_fn, Future},
+    mem,
+    pin::Pin,
+    ptr,
+    task::{Context, Poll},
+};
+use ruspiro_arch_aarch64::instructions::*;
+use ruspiro_console::{error, info, warn};
 use ruspiro_error::{Error, GenericError};
 use ruspiro_lock::r#async::{AsyncMutex, AsyncMutexGuard, AsyncSemaphore};
-use ruspiro_lock::sync::Semaphore;
+use ruspiro_lock::sync::{RWLock, Semaphore};
 use ruspiro_mailbox::Mailbox;
 use ruspiro_mmu::{map_memory, page_align, page_size};
-use crate::shared::slotzero::{SlotZero, SlotZeroAccessor};
-use crate::VchiqResult;
-use ruspiro_console::{error, info};
-use ruspiro_arch_aarch64::instructions::*;
 
 #[allow(non_camel_case_types, dead_code)]
-#[derive(Debug, Copy, Clone)]
-pub enum VchiqConnectState {
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum ConnectState {
     DISCONNECTED,
     CONNECTING,
     CONNECTED,
@@ -50,131 +60,9 @@ pub enum VchiqConnectState {
     RESUME_TIMEOUT,
 }
 
-pub struct State {
+pub(crate) struct State {
     /// flag indicating whether the [State] has been initialized
     initialized: bool,
-    /// Sempahore indicating a connect message has been received
-    connect: AsyncSemaphore,
-    /// Semaphore used to indicate how many slots are available
-    slot_available_event: Semaphore,
-    /// the inner state able to be shared accross cores and to be used in async code
-    inner: Arc<AsyncMutex<StateInner>>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        info!("drop state");
-    }
-}
-
-impl State {
-    pub fn new() -> VchiqResult<Self> {
-        let inner = StateInner::new()?;
-        let slot_available_event = Semaphore::new(inner.slot_queue_available);
-
-        Ok(Self {
-            initialized: false,
-            connect: AsyncSemaphore::new(0),
-            slot_available_event,
-            inner: Arc::new(AsyncMutex::new(inner)),
-        })
-    }
-
-    pub async fn initialize(&mut self) -> VchiqResult<()> {
-        if !self.initialized {
-            let mut state = self.inner.lock().await;
-            state.initialize()?;
-
-            self.initialized = true;
-        }
-
-        Ok(())
-    }
-
-    /// get the current connection state with a short living lock on the inner state
-    async fn connection_state(&self) -> VchiqConnectState {
-        let state = self.inner.lock().await;
-        state.conn_state
-    }
-
-    async fn set_connection_state(&self, conn_state: VchiqConnectState) {
-        let mut state = self.inner.lock().await;
-        state.set_conn_state(conn_state);
-    }
-
-    pub async fn connect(&self) -> VchiqResult<()> {
-        if self.initialized {
-            let conn_state = self.connection_state().await;
-            if let VchiqConnectState::DISCONNECTED = conn_state {
-                self.queue_message::<()>(None, make_msg_id(MessageType::CONNECT, 0, 0), None, true)
-                    .await?;
-                info!("update connection state");
-                self.set_connection_state(VchiqConnectState::CONNECTING)
-                    .await;
-            };
-
-            info!("next stage");
-            let conn_state = self.connection_state().await;
-            if let VchiqConnectState::CONNECTING = conn_state {
-                info!("VCHIQ in 'connecting' state");
-                self.connect.down().await;
-                info!("connect semaphore down");
-                self.set_connection_state(VchiqConnectState::CONNECTED)
-                    .await;
-
-                return Ok(());
-            };
-
-            info!("state was not connecting...");
-            unreachable!();
-        } else {
-            Err(GenericError::with_message("VCHIQ State not initialized").into())
-        }
-    }
-
-    pub async fn add_service(
-        &self,
-        srv_params: ServiceParams,
-        srv_state: ServiceState,
-    ) -> VchiqResult<ServiceHandle> {
-        StateInner::add_service(Arc::clone(&self.inner), srv_params, srv_state).await
-    }
-
-    pub fn remove_service(&self, srv_handle: ServiceHandle) -> VchiqResult<()> {
-        StateInner::remove_service(Arc::clone(&self.inner), srv_handle)
-    }
-
-    pub async fn open_service(&self, srv_handle: ServiceHandle) -> VchiqResult<()> {
-        StateInner::open_service(Arc::clone(&self.inner), srv_handle).await
-    }
-
-    async fn queue_message<T>(
-        &self,
-        service: Option<u32>,
-        msg_id: u32,
-        context: Option<T>,
-        is_blocking: bool,
-    ) -> VchiqResult<()>
-    where T: core::fmt::Debug
-    {
-        StateInner::queue_message(
-            Arc::clone(&self.inner),
-            service,
-            msg_id,
-            context,
-            is_blocking,
-        )
-        .await
-    }
-
-    pub async fn handle_slots(&self) {
-        let mut state = self.inner.lock().await;
-        state.slot_zero.local_mut().trigger_mut().wait().await;
-        state.parse_rx_slots(self);
-    }
-}
-
-struct StateInner {
     /// Raw pointer to memory allocated to be shared between the between ARM and VideoCore. This memory region need
     /// special attributes to ensure the data updated by either side is immediately seen by the other one without any
     /// caching. This is usually ensures by setting up the MMU and configure this region to be coherent, shared and not
@@ -187,42 +75,113 @@ struct StateInner {
     shm_ptr_phys: *const u8,
     /// The memory layout used to allocate the shared memory, required for deallocation
     shm_ptr_layout: Layout,
+    /// The part of the state related to the Slot data that is required to be mutated individually
+    pub slot_state: RWLock<SlotState>,
+    /*
     /// Accessor to the [SlotZero] data stored in the shared memory region
     slot_zero: SlotZeroAccessor,
     /// Accessor to the generic [Slot] data stored in the shared memory region. Keep in mind that an index 0 into the
     /// `slot_data` will point to the [SlotZero] part.
     slot_data: SlotAccessor,
-    /// the actual connection state from ARM to VideoCore
-    conn_state: VchiqConnectState,
     // slot index and offset to where the next message could be written to the `slot_data`
     tx_data: Option<SlotPosition>,
     // slot index and offset from where the next message can be read from the `slot_data`
     rx_data: Option<SlotPosition>,
     /// a cached copy of value from `self.slot_zero.local_ref().tx_pos()`.
     /// Only write `self.slot_zero.local_mut().set_tx_pos()`, and read `self.slot_zero.remote_ref().tx_pos()`
-    local_tx_pos: u32,
+    local_tx_pos: usize,
     /// indicates the byte position within the slot data from where the next message will be read. The least
     /// significant bits are an index into the slot. The next bits are the index of the slot in
     /// [self.slot_zero.remote().slot_queue]
-    rx_pos: u32,
+    rx_pos: usize,
+    */
+    /// the actual connection state from ARM to VideoCore
+    conn_state: RefCell<ConnectState>,
+
     /// The slot_queue index of the slot to become available next.
-    slot_queue_available: u32,
-
-    /// The list of services known to the VCHIQ interface
-    services: Vec<Option<Service>>,
-    /// The number of the first unused service
-    unused_service: u32,
-
+    slot_queue_available: usize,
+    /// Indicates that the slot_handler is requested to poll service specific
+    /// messages. This is seen as a 'rare' condition in the linux implementation
+    poll_needed: bool,
+    /// The part of the State related to the quota that requires to be individually mutated
+    pub quota_state: RWLock<QuotaState>,
+    /*
+    // The index of the previous slot used for data messages
+    previous_data_index: isize,
+    /// The number of slots occupied by a data message
+    data_use_count: usize,
+    /// The maximum number of slots to be occupied by a data message
+    data_quota: usize,
     /// The list of quota's for the services known to the VCHIQ interface
     service_quotas: Vec<ServiceQuota>,
+    */
+    /// The part of the State related to the services that requires to be individually mutated
+    pub srv_state: RWLock<SrvState>,
+    /*
+    /// The list of services known to the VCHIQ interface
+    /// The elements are wrapped in a RefCell to allow individual mutable access
+    /// as well as in an Arc to keep access around without keeping the inner state borrowed
+    services: Vec<Option<Arc<RefCell<Service>>>>,
+    /// The number of the first unused service
+    unused_service: usize,
+    */
     /// default quota for slots
-    default_slot_quota: u32,
+    default_slot_quota: usize,
     /// default quota for messages
-    default_message_quota: u32,
+    default_message_quota: usize,
+    /// Sempahore indicating a connect message has been received
+    pub connect: AsyncSemaphore,
+    /// Semaphore used to indicate how many slots are available
+    slot_available_event: Semaphore,
+    slot_remove_event: Semaphore,
+    data_quota_event: Semaphore,
 }
 
-impl StateInner {
-    fn new() -> VchiqResult<Self> {
+pub(crate) struct SlotState {
+    /// Accessor to the [SlotZero] data stored in the shared memory region
+    pub slot_zero: SlotZeroAccessor,
+    /// Accessor to the generic [Slot] data stored in the shared memory region. Keep in mind that an index 0 into the
+    /// `slot_data` will point to the [SlotZero] part.
+    pub slot_data: SlotAccessor,
+    // slot index and offset to where the next message could be written to the `slot_data`
+    pub tx_data: Option<SlotPosition>,
+    // slot index and offset from where the next message can be read from the `slot_data`
+    pub rx_data: Option<SlotPosition>,
+    /// a cached copy of value from `self.slot_zero.local_ref().tx_pos()`.
+    /// Only write `self.slot_zero.local_mut().set_tx_pos()`, and read `self.slot_zero.remote_ref().tx_pos()`
+    pub local_tx_pos: usize,
+    /// indicates the byte position within the slot data from where the next message will be read. The least
+    /// significant bits are an index into the slot. The next bits are the index of the slot in
+    /// [self.slot_zero.remote().slot_queue]
+    pub rx_pos: usize,
+}
+
+pub(crate) struct QuotaState {
+    // The index of the previous slot used for data messages
+    pub previous_data_index: isize,
+    /// The number of slots occupied by a data message
+    pub data_use_count: usize,
+    /// The maximum number of slots to be occupied by a data message
+    pub data_quota: usize,
+    /// The list of quota's for the services known to the VCHIQ interface
+    pub service_quotas: Vec<ServiceQuota>,
+}
+
+pub(crate) struct SrvState {
+    /// The list of services known to the VCHIQ interface
+    /// The elements are wrapped in a RefCell to allow individual mutable access
+    /// as well as in an Arc to keep access around without keeping the inner state borrowed
+    services: Vec<Option<Arc<RefCell<Service>>>>,
+    /// The number of the first unused service
+    unused_service: usize,
+}
+
+impl State {
+    /// Create a new State instance. This is creating a specfic memory region that will be shared
+    /// between the VideoCore and the ARM as data transfer channel between the two sides. The memory
+    /// region used is configured to be not cached to ensure cross core coherency (all cores and the VC
+    /// does see the same content without cahce maintenance operations)
+    pub(crate) fn new() -> VchiqResult<Self> {
         // The State will own a memory region that is shared between the ARM and the VideoCore. This memory region will
         // be re-used to provide different views onto it during runtime
         // the total memory we require to allocate need to be page aligned. The memory page size depends on the MMU
@@ -290,66 +249,70 @@ impl StateInner {
         }
 
         let slot_queue_available =
-            slot_zero.local_ref().slot_last() - slot_zero.local_ref().slot_first() + 1;
+            (slot_zero.local_ref().slot_last() - slot_zero.local_ref().slot_first() + 1) as usize;
         let default_slot_quota = slot_queue_available / 2;
         let default_message_quota = cmp::min(default_slot_quota * 256, !0);
 
         let mut services = Vec::with_capacity(VCHIQ_MAX_SERVICES as usize);
-        services.resize_with(VCHIQ_MAX_SERVICES as usize, || None);
+        services.resize_with(VCHIQ_MAX_SERVICES, || None); //Arc::new(RefCell::new(None)));
 
         let mut service_quotas = Vec::with_capacity(VCHIQ_MAX_SERVICES);
         service_quotas.resize_with(VCHIQ_MAX_SERVICES, || ServiceQuota::default());
 
         Ok(Self {
+            initialized: false,
             shm_ptr,
             shm_ptr_phys,
             shm_ptr_layout: layout,
-            slot_zero,
-            slot_data,
-            conn_state: VchiqConnectState::DISCONNECTED,
-            tx_data: None,
-            rx_data: None,
-            local_tx_pos: 0,
-            rx_pos: 0,
+            slot_state: RWLock::new(SlotState {
+                slot_zero,
+                slot_data,
+                tx_data: None,
+                rx_data: None,
+                local_tx_pos: 0,
+                rx_pos: 0,
+            }),
+            connect: AsyncSemaphore::new(0),
+            conn_state: RefCell::new(ConnectState::DISCONNECTED),
 
             slot_queue_available,
-            
-            services,
-            unused_service: 0,
 
-            service_quotas,
+            quota_state: RWLock::new(QuotaState {
+                previous_data_index: -1,
+                data_use_count: 0,
+                data_quota: slot_queue_available - 1,
+                service_quotas,
+            }),
+
+            srv_state: RWLock::new(SrvState {
+                services,
+                unused_service: 0,
+            }),
+
             default_slot_quota,
             default_message_quota,
+
+            poll_needed: false,
+
+            slot_available_event: Semaphore::new(slot_queue_available as u32),
+            slot_remove_event: Semaphore::new(0),
+            data_quota_event: Semaphore::new(0),
         })
     }
 
-    fn set_conn_state(&mut self, new_state: VchiqConnectState) {
-        info!(
-            "change conn_state from {:?} to {:?}",
-            self.conn_state, new_state
-        );
-        self.conn_state = new_state;
-    }
-
-    /// Initilize the VCHIQ interface by sending the shared memory loction to the VideoCore using
-    /// a mailbox call.
-    ///
-    /// mut access:
-    ///     - slot_zero.slot data
-    ///     - slot_zero.local.sync_release
-    ///
-    fn initialize(&mut self) -> VchiqResult<()> {
+    /// Initialize the VCHIQ state and the shared memory region for usage and also notify the VideoCore
+    /// about the address of this memory region to get the communication kicked off
+    pub(crate) fn initialize(&mut self) -> VchiqResult<()> {
+        let mut slot_state = self.slot_state.lock();
         // before notifying the VideoCore with the Slot address containing the data for the initial
         // "handshake" mark the sync_slot to be empty and available
-        let slot_index = self.slot_zero.local_ref().slot_sync() as usize;
-        self.slot_data.store_message(
+        let slot_index = slot_state.slot_zero.local_ref().slot_sync() as usize;
+        slot_state.slot_data.store_message(
             SlotPosition::new(slot_index, 0),
             |message: &mut SlotMessage<()>| {
                 message.header.msgid = VCHIQ_MSGID_PADDING;
             },
         );
-        // let the local Future handling sync_release event's pick this up
-        //self.slot_zero.local_mut().sync_release_mut().signal_local();
 
         // ensure data is in sync and has finished writing to memory before sending the memory address to the
         // VideoCore
@@ -357,7 +320,7 @@ impl StateInner {
         dmb();
 
         // ensure data is not stuck in cache and VideoCore sees the correct values
-        //flush_dcache_range(self.shm_ptr as usize, self.shm_ptr_layout.size());
+        // TODO: do not instatiate the Mailbox here - should be a Singleton ?
         let mut mb = Mailbox::new();
         let status = mb.set_vchiq_slot_base(self.shm_ptr_phys as u32)?;
 
@@ -367,17 +330,46 @@ impl StateInner {
         if status != 0 {
             error!(
                 "MB Error {:#x} - SlotZero:\r\n{:#?}",
-                status, self.slot_zero
+                status, slot_state.slot_zero
             );
             return Err(GenericError::with_message("unable to set VCHIQ base address").into());
+        }
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Perform the initial handshake to the VideoCore by sending a connection request and wait for its response
+    /// We need to mutate:
+    /// - conn_state, slot_zero, slot_data, local_tx_pos, tx_data
+    pub(crate) async fn connect(&self) -> VchiqResult<()> {
+        // ensure the state and this - the shared memory region is initialized
+        if !self.initialized {
+            return Err(VchiqError::StateNotInitialized.into());
+        }
+
+        if *self.conn_state.borrow() == ConnectState::DISCONNECTED {
+            // if we are in disconnection state send a connect message to the VideoCore
+            self.queue_message::<()>(None, make_msg_id(MessageType::CONNECT, 0, 0), None, true)
+                .await?;
+            info!("update connection state");
+            *self.conn_state.borrow_mut() = ConnectState::CONNECTING;
+        }
+
+        if *self.conn_state.borrow() == ConnectState::CONNECTING {
+            // if we are in a pending connection state wait for the VC to respond to the connection request
+            info!("wait for VC CONNECT");
+            self.connect.down().await;
+            *self.conn_state.borrow_mut() = ConnectState::CONNECTED;
         }
 
         Ok(())
     }
 
-    /// Add a new service to be used for communications between ARM and VideoCore
-    async fn add_service(
-        this: Arc<AsyncMutex<Self>>,
+    /// Add a new Service to the state
+    /// This mutates the services and quota
+    pub(crate) async fn add_service(
+        &self,
         srv_params: ServiceParams,
         srv_state: ServiceState,
     ) -> VchiqResult<ServiceHandle> {
@@ -385,82 +377,70 @@ impl StateInner {
         if let ServiceState::OPENING = srv_state {
             service.public_fourcc = None;
         }
-        
+
         let mut srv_index = None;
-        let mut state = this.lock().await;
-        if let ServiceState::OPENING = srv_state {
+        let mut service_state = self.srv_state.lock();
+        if srv_state == ServiceState::OPENING {
             // find the first index with an unused service
-            srv_index = state.services[..state.unused_service as usize]
+            srv_index = service_state.services[..service_state.unused_service as usize]
                 .iter()
                 .enumerate()
-                .find_map(
-                    |(idx, service)| {
-                        match service {
-                            None => Some(idx as u32),
-                            _ => None
-                        }
-                    }
-                );
+                .find_map(|(idx, service)| match service {
+                    None => Some(idx),
+                    _ => None,
+                });
         } else {
             // if the requested state of the service is not "OPENING" then check the list of services in reverse
             // order that there is no service already existing using the same fourCC
             // TODO: implement the verification as in linux, skip this for the time beeing
-            srv_index = state.services[..state.unused_service as usize]
+            srv_index = service_state.services[..service_state.unused_service as usize]
                 .iter()
                 .rev()
                 .enumerate()
-                .find_map(
-                    |(idx, service)| {
-                        match service {
-                            None => Some(idx as u32),
-                            _ => None
-                        }
-                    }
-                );
+                .find_map(|(idx, service)| match service {
+                    None => Some(idx),
+                    _ => None,
+                });
         }
 
         // if there could not be any free index found, check for the last unused one
         if srv_index.is_none() {
-            if (state.unused_service as usize) < VCHIQ_MAX_SERVICES {
-                srv_index.replace(state.unused_service);
+            if (service_state.unused_service as usize) < VCHIQ_MAX_SERVICES {
+                srv_index.replace(service_state.unused_service);
             }
         }
 
         if let Some(reuse_idx) = srv_index {
             let service_handle = service.handle;
-            service.localport = reuse_idx;
-            info!("add new service {:#?} at index {}", service.base.fourcc, reuse_idx);
+            service.localport = reuse_idx as u32;
+            info!(
+                "add new service {:#?} at index {}",
+                service.base.fourcc, reuse_idx
+            );
             service.set_state(srv_state);
-            state.services[reuse_idx as usize].replace(service);
-            state.unused_service += 1;
+            service_state.services[reuse_idx as usize].replace(Arc::new(RefCell::new(service)));
+            service_state.unused_service += 1;
 
             // once we have added the new service we need to maintain it's quota
-            let slot_quota = state.default_slot_quota;
-            let message_quota = state.default_message_quota;
-            let local_tx_pos = state.local_tx_pos as usize;
-            if let Some(mut quota) = state.service_quotas.get_mut(reuse_idx as usize) {
+            let mut quota_state = self.quota_state.lock();
+            let slot_quota = self.default_slot_quota;
+            let message_quota = self.default_message_quota;
+            let local_tx_pos = self.slot_state.read().local_tx_pos;
+            if let Some(mut quota) = quota_state.service_quotas.get_mut(reuse_idx as usize) {
                 quota.slot_quota = slot_quota;
                 quota.message_quota = message_quota;
                 if quota.slot_use_count == 0 {
-                    quota.previous_tx_index = slot_queue_index_from_pos(local_tx_pos) as i32 - 1;
+                    quota.previous_tx_index = slot_queue_index_from_pos(local_tx_pos) as isize - 1;
                 }
             }
 
-            Ok(
-                service_handle
-            )
+            Ok(service_handle)
         } else {
-            Err(
-                GenericError::with_message("unable to add a new service").into()
-            )
+            Err(VchiqError::UnableToAddService.into())
         }
     }
 
-    pub fn remove_service(this: Arc<AsyncMutex<Self>>, handle: ServiceHandle) -> VchiqResult<()> {
-        todo!("remove service not yet implemented");
-    }
-
-    pub async fn open_service(this: Arc<AsyncMutex<Self>>, handle: ServiceHandle) -> VchiqResult<()> {
+    pub(crate) async fn open_service(&self, srv_handle: ServiceHandle) -> VchiqResult<()> {
         #[derive(Debug)]
         struct OpenPayload {
             fourcc: FourCC,
@@ -470,9 +450,10 @@ impl StateInner {
         }
 
         let (context, localport) = {
-            let state = this.lock().await;
-            let service = state.service_from_handle(handle).unwrap();
+            //let state = this.lock().await;
+            let service = self.service_from_handle(srv_handle).unwrap();
             // use service
+            let service = service.borrow();
 
             let payload = OpenPayload {
                 fourcc: service.base.fourcc,
@@ -480,44 +461,35 @@ impl StateInner {
                 version: service.version,
                 version_min: service.version_min,
             };
-            
-            (
-                payload,
-                service.localport
-            )
+
+            (payload, service.localport)
         };
 
-        StateInner::queue_message(
-            Arc::clone(&this), 
-            None, 
-            make_msg_id(MessageType::OPEN, 
-            localport, 
-            0),
+        self.queue_message(
+            None,
+            make_msg_id(MessageType::OPEN, localport, 0),
             Some(context),
-            true).await?;
+            true,
+        )
+        .await?;
 
         // wait for the ACK/NACK of the message just queued
         info!("waiting for OpenService ACK/NACK");
-        
+
         //let srvstate = StateWaitOpenServiceFuture::new(Arc::clone(&this), handle).await;
-        let state = Arc::clone(&this);
-        let srvstate = core::future::poll_fn(move |cx| {
-            // check if we can lock the state
-            match Box::pin(state.lock()).as_mut().poll(cx) {
-                // locking the state successfull, now check for the service state
-                Poll::Ready(locked_state) => {
-                    let service = locked_state.service_from_handle(handle).unwrap();
-                    if service.remove_event.try_down().is_ok() {
-                        Poll::Ready(service.srvstate)
-                    } else {
-                        //info!("wake wait open service");
-                        cx.waker().wake_by_ref(); // the Future need to be woken
-                        Poll::Pending
-                    }
-                }
-                Poll::Pending => Poll::Pending, // if the lock provides pending the lock will wake this future
+        //let state = Arc::clone(&this);
+        let srvstate = core::future::poll_fn(|cx| {
+            let service = self.service_from_handle(srv_handle).unwrap();
+            let service = service.borrow();
+            if service.remove_event.try_down().is_ok() {
+                Poll::Ready(service.srvstate)
+            } else {
+                //info!("wake wait open service");
+                cx.waker().wake_by_ref(); // the Future need to be woken
+                Poll::Pending
             }
-        }).await;
+        })
+        .await;
         info!("Service state: {:?}", srvstate);
 
         match srvstate {
@@ -525,46 +497,316 @@ impl StateInner {
             _ => {
                 error!("unable to open service, current state {:?}", srvstate);
                 //let _ = State::release_service(state.clone(), handle);
-                Err(
-                    GenericError::with_message("unable to open service").into()
-                )
+                Err(VchiqError::UnableToOpenService(srv_handle).into())
             }
         }
     }
 
-    /// Queue a message to be send to the VideoCore. It will be stored in the slot data of the next available slot
-    ///
-    /// mut access:
-    ///     - slot_data
-    ///     - slot_zero.local
-    ///     - slot_zero.remote
-    ///
-    async fn queue_message<T>(
-        this: Arc<AsyncMutex<Self>>,
-        service: Option<u32>,
+    pub(crate) async fn close_service(&self, srv_handle: ServiceHandle) -> VchiqResult<()> {
+        let service = self.service_from_handle(srv_handle)?;
+        let mut service_mut = service.borrow_mut();
+        info!("closing service w. local port {}", service_mut.localport);
+
+        match service_mut.srvstate {
+            ServiceState::FREE | ServiceState::LISTENING | ServiceState::HIDDEN => {
+                // unlock_service
+                return Err(VchiqError::UnableToCloseService(srv_handle).into());
+            }
+            _ => (),
+        }
+
+        // mark the service closing
+        service_mut.closing = true;
+        drop(service_mut);
+
+        // close_service_internal in case we are called in the context of the slot_handler thread
+        // which would never be the case, would it?
+        // if we are called outside the slot_handler thread
+        // call request_poll for this service with the event VCHIQ_POLL_REMOVE
+        // request_poll does set some service related atomic flags and triggers the slot_handler
+        // to run. For the time beeing do the "close_service_internal" right here, w/o bothering
+        // the slot handler
+        // wrap the content in it's own scope block it is assumed to be called with
+        // close_recvd = false
+        {
+            let close_recvd = false;
+            // the following part is in the vchiq_close_service_internal function in linux and also called from the
+            // slot_handler based on specific rare conditions... implement this here first to verify it's function
+            let srvstate = service.borrow().srvstate;
+            match srvstate {
+                ServiceState::CLOSED
+                | ServiceState::HIDDEN
+                | ServiceState::LISTENING
+                | ServiceState::CLOSEWAIT => {
+                    if close_recvd {
+                        error!("close service called in state {:?}", srvstate);
+                    } else
+                    //if is_server - which is always false I'd guess as we are implementing the client only!
+                    {
+                        self.free_service(Arc::clone(&service));
+                    }
+
+                    Ok(())
+                }
+
+                ServiceState::OPENING => {
+                    if close_recvd {
+                        service.borrow_mut().set_state(ServiceState::CLOSEWAIT);
+                        service.borrow().remove_event.up();
+                        Ok(())
+                    } else {
+                        let localport = service.borrow().localport;
+                        let remoteport = service.borrow().remoteport & 0x0FFF;
+                        self.queue_message::<()>(
+                            Some(Arc::clone(&service)),
+                            make_msg_id(MessageType::CLOSE, localport, remoteport),
+                            None,
+                            false,
+                        )
+                        .await
+                    }
+                }
+
+                ServiceState::OPENSYNC | ServiceState::OPEN => {
+                    if close_recvd {
+                        // TODO: abort bulks
+                    }
+
+                    // release_service_message(service)
+
+                    let localport = service.borrow().localport;
+                    let remoteport = service.borrow().remoteport & 0x0FFF;
+                    // release service_message
+                    if self
+                        .queue_message::<()>(
+                            Some(Arc::clone(&service)),
+                            make_msg_id(MessageType::CLOSE, localport, remoteport),
+                            None,
+                            false,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        if !close_recvd {
+                            service.borrow_mut().set_state(ServiceState::CLOSESENT);
+                        }
+                        // else
+                        // set state to CLOSERECVD
+                    };
+
+                    Ok(())
+                    // TODO: close_service_complete -> this would invoke a call back
+                    //
+                }
+
+                ServiceState::CLOSESENT => {
+                    todo!();
+                }
+
+                ServiceState::CLOSERECVD => {
+                    todo!();
+                }
+
+                _ => {
+                    warn!("Close called in state {:?}", service.borrow().srvstate);
+                    Ok(())
+                }
+            }
+        }?;
+
+        // now wait for the remove_event triggered for the service
+        poll_fn(|cx| {
+            let service = self.service_from_handle(srv_handle).unwrap();
+            let service = service.borrow();
+            if service.remove_event.try_down().is_ok() {
+                if service.srvstate == ServiceState::FREE
+                    || service.srvstate == ServiceState::OPEN
+                    || service.srvstate == ServiceState::LISTENING
+                {
+                } else {
+                    warn!(
+                        "close service {} remains in state {:?}",
+                        service.localport, service.srvstate
+                    );
+                }
+
+                Poll::Ready(
+                    if service.srvstate != ServiceState::FREE
+                        && service.srvstate != ServiceState::LISTENING
+                    {
+                        Err(VchiqError::UnableToCloseService(srv_handle).into())
+                    } else {
+                        Ok(())
+                    },
+                )
+            } else {
+                //info!("wake wait open service");
+                cx.waker().wake_by_ref(); // the Future need to be woken
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Finalizing the service closure
+    pub(crate) fn close_service_complete(
+        &self,
+        service: Arc<RefCell<Service>>,
+        failstate: ServiceState,
+    ) -> VchiqResult<()> {
+        let srvstate = service.borrow().srvstate;
+        match srvstate {
+            ServiceState::OPEN | ServiceState::CLOSESENT | ServiceState::CLOSERECVD => {
+                service.borrow_mut().set_state(ServiceState::CLOSED);
+            }
+            ServiceState::LISTENING => (),
+            _ => {
+                error!(
+                    "close service complete called in service state {:?}",
+                    srvstate
+                );
+                return Err(VchiqError::UnableToCloseService(service.borrow().handle).into());
+            }
+        };
+
+        // TODO: make service callback with message SERVICE_CLOSED
+        // if this call fails set the failstate of the service and return
+
+        // TODO: check if this is really required, this seem to clean up all "manually" counted usages
+        // of the service? Should be enough to remove the service from the service list
+        // and thus the Arc shall release the memory of the service as soon as all Arc references goes out of
+        // scope - we need to verify that this will be actually the case and no one is holding
+        // a service reference any longer ...
+        let use_count = service.borrow().service_use_count;
+        for _ in 0..use_count {
+            // release_service_internal(service);
+        }
+
+        service.borrow_mut().client_id = 0;
+        service.borrow_mut().remoteport = VCHIQ_PORT_FREE;
+        let srvstate = service.borrow().srvstate;
+        if srvstate == ServiceState::CLOSED {
+            self.free_service(Arc::clone(&service));
+        } else if srvstate != ServiceState::CLOSEWAIT {
+            service.borrow().remove_event.up();
+        };
+
+        Ok(())
+    }
+
+    fn free_service(&self, service: Arc<RefCell<Service>>) {
+        info!("free service");
+        let mut service = service.borrow_mut();
+        match service.srvstate {
+            ServiceState::OPENING
+            | ServiceState::CLOSED
+            | ServiceState::HIDDEN
+            | ServiceState::LISTENING
+            | ServiceState::CLOSEWAIT => (),
+
+            _ => {
+                error!("free service - wrong state {:?}", service.srvstate);
+                return;
+            }
+        };
+
+        service.set_state(ServiceState::FREE);
+        service.remove_event.up();
+
+        // TODO: this service should now beeing "dropped" and removed from the services
+        // list.
+    }
+
+    /// Queue a message to the VideoCore.
+    /// This will mutate:
+    /// slot_zero, slot_data, local_tx_pos and tx_data
+    /// previous_data_index, data_use_count, service_quotas of one service
+    async fn queue_message<T: core::fmt::Debug>(
+        &self,
+        service: Option<Arc<RefCell<Service>>>,
         msg_id: u32,
         context: Option<T>,
-        is_blocking: bool,
-    ) -> VchiqResult<()>
-    where T: core::fmt::Debug
-    {
+        block: bool,
+    ) -> VchiqResult<()> {
         let msg_type = msg_type_from_id(msg_id);
         let msg_size = context.as_ref().map_or(0, |_| mem::size_of::<T>());
         let msg_stride = calc_msg_stride(msg_size);
 
-        let mut state = this.lock().await;
+        info!("queue message {:?}", msg_type);
+        // slot_mutex lock
+        if msg_type == MessageType::DATA {
+            let slot_state = self.slot_state.read();
+            let quota_state = self.quota_state.read();
+            // This message type can only be queued in a context of a service
+            // slot_mutex unlock on error
+            let service = service
+                .as_ref()
+                .ok_or(VchiqError::DataMessageWithoutService)?;
+            let service = service.borrow_mut();
+            // this service is not allowed to be closed
+            if service.closing {
+                // slot_mutex unlock
+                return Err(VchiqError::ServiceAlreadyClosed(service.handle).into());
+            }
 
-        // message handling differs on the message type
-        if let MessageType::DATA = msg_type {
-            // TODO!
-            unimplemented!();
+            let service_quota = quota_state
+                .service_quotas
+                .get(service.localport as usize)
+                .unwrap();
+            // lock quota spinlock
+            let mut tx_end_index =
+                slot_queue_index_from_pos(slot_state.local_tx_pos + msg_stride - 1) as isize;
+            // ensure data messages don't use more than their quota of slots
+            while (tx_end_index as isize) != quota_state.previous_data_index
+                && quota_state.data_use_count == quota_state.data_quota
+            {
+                // unlock quota spinlock
+                // slot_mutex unlock
+                self.data_quota_event.down(); // TODO: wait as async?
+                                              // lock quota spinlock
+                                              // slot_mutex lock
+                tx_end_index =
+                    slot_queue_index_from_pos(slot_state.local_tx_pos + msg_stride - 1) as isize;
+                if (tx_end_index as isize) == quota_state.previous_data_index
+                    || quota_state.data_use_count < quota_state.data_quota
+                {
+                    self.data_quota_event.up();
+                    break;
+                }
+            }
+
+            while service_quota.message_use_count == service_quota.message_quota
+                || (tx_end_index != service_quota.previous_tx_index
+                    && service_quota.slot_use_count == service_quota.slot_quota)
+            {
+                // unlock quota spinlock
+                // slot_mutex unlock
+                service_quota.quota_event.down(); // TODO: wait async?
+                if service.closing {
+                    return Err(VchiqError::ServiceClosing.into());
+                }
+                // slot_mutex lock
+                if service.srvstate != ServiceState::OPEN {
+                    // slot_mutex unlock
+                    return Err(VchiqError::ServiceAlreadyClosed(service.handle).into());
+                }
+                // lock quota spinlock
+                tx_end_index =
+                    slot_queue_index_from_pos(slot_state.local_tx_pos + msg_stride - 1) as isize;
+            }
+            //unlock quota spinlock
         }
 
         // reserve space for the new message within the slots used for transmitting data
-        let slot_position = Self::reserve_space(&mut state, msg_stride, is_blocking).await?;
+        let slot_position = self.reserve_space(msg_stride, block).await?;
 
+        let mut slot_state = self.slot_state.lock();
+        info!("slot locked");
+        let mut quota_state = self.quota_state.lock();
+        info!("quota locked");
+        let tx_end_index = slot_queue_index_from_pos(slot_state.local_tx_pos - 1) as isize;
         // once we knew the position where to put the message we can store it there
-        state
+        slot_state
             .slot_data
             .store_message::<T, _>(slot_position, |message| {
                 info!(
@@ -573,7 +815,36 @@ impl StateInner {
                 );
 
                 if let MessageType::DATA = msg_type {
-                    unimplemented!()
+                    // if message context data is given copy this to the payload
+                    // can this fail?
+                    if let Some(cx) = context {
+                        info!("copy message context");
+                        message.data = cx;
+                    }
+                    // lock quota_spinlock
+
+                    // if this transmission can't fit in the last slot used by any service, the data_use_count
+                    // must be increased
+                    if tx_end_index != quota_state.previous_data_index {
+                        quota_state.previous_data_index = tx_end_index;
+                        quota_state.data_use_count += 1;
+                    }
+
+                    // unwrap is fine here as we would never get here if this service does not exist (checked at the
+                    // beginning of this method)
+                    let service = (&service).as_ref().unwrap().borrow();
+                    let service_quota = quota_state
+                        .service_quotas
+                        .get_mut(service.localport as usize)
+                        .unwrap();
+
+                    // if the current slot is not the same last used by this service, the service's slot_use_count
+                    // must be increased
+                    if tx_end_index != service_quota.previous_tx_index {
+                        service_quota.previous_tx_index = tx_end_index;
+                        service_quota.slot_use_count += 1;
+                    }
+                // unlock quota_spinlock
                 } else {
                     // if message context data is given copy this to the payload
                     if let Some(cx) = context {
@@ -590,21 +861,27 @@ impl StateInner {
         dsb();
 
         // now let the other side know about the new message put into the slot data by updating the local tx_pos
-        let tx_pos = state.local_tx_pos;
+        let tx_pos = slot_state.local_tx_pos;
         info!("set local_tx_pos to {}", tx_pos);
-        state.slot_zero.local_mut().set_tx_pos(tx_pos);
+        slot_state.slot_zero.local_mut().set_tx_pos(tx_pos as u32);
         dmb();
         dsb();
 
-        if let Some(service) = service {
+        if let Some(ref service) = service {
             // TODO: handling of service related messages
-            if let MessageType::CLOSE = msg_type {
-                unimplemented!()
+            if msg_type == MessageType::CLOSE {
+                // set the service state to CLOSESENT
+                info!("set state CLOSESENT");
+                service.borrow_mut().set_state(ServiceState::CLOSESENT);
             }
         }
 
         // now it's time to inform the VideoCore to pickup the work
-        state.slot_zero.remote_mut().trigger_mut().signal_remote();
+        slot_state
+            .slot_zero
+            .remote_mut()
+            .trigger_mut()
+            .signal_remote();
         info!("message queued and VC notified");
 
         Ok(())
@@ -618,17 +895,12 @@ impl StateInner {
     ///     - slot_zero.remote
     ///     - local_tx_pos
     ///     - tx_data
-    async fn reserve_space(
-        state: &mut AsyncMutexGuard<'_, Self>,
-        space_needed: usize,
-        is_blocking: bool,
-    ) -> VchiqResult<SlotPosition> {
-        // lock the state for the duration of space reservation
-        //let mut state = this.lock().await;
+    async fn reserve_space(&self, space_needed: usize, block: bool) -> VchiqResult<SlotPosition> {
+        let mut slot_state = self.slot_state.lock();
         // get the current position where the next message should be written that is known in the other side
-        let mut tx_pos = state.local_tx_pos;
+        let mut tx_pos = slot_state.local_tx_pos;
         // calculate the space remaining in the actual used Slot based on this position
-        let slot_space = VCHIQ_SLOT_SIZE - (tx_pos as usize & VCHIQ_SLOT_MASK);
+        let slot_space = VCHIQ_SLOT_SIZE - (tx_pos & VCHIQ_SLOT_MASK);
 
         info!(
             "reserve space of {} bytes from the slot  with {} bytes",
@@ -638,25 +910,27 @@ impl StateInner {
         if space_needed > slot_space {
             // well the requested space will not fit into the same slot that is already in use, so add
             // a padding message into the same and use the next slot
-            let slot_pos = state
+            let slot_pos = slot_state
                 .tx_data
                 .as_ref()
                 .expect("no slot available to be used")
                 .clone();
             let size = slot_space - mem::size_of::<SlotMessageHeader>();
-            state.slot_data.store_message::<(), _>(slot_pos, |message| {
-                message.header.msgid = VCHIQ_MSGID_PADDING;
-                message.header.size = size as u32;
-            });
+            slot_state
+                .slot_data
+                .store_message::<(), _>(slot_pos, |message| {
+                    message.header.msgid = VCHIQ_MSGID_PADDING;
+                    message.header.size = size as u32;
+                });
 
             // tx_pos is now pointing to the start of the next slot
-            tx_pos += slot_space as u32;
+            tx_pos += slot_space;
         }
 
         // if tx_pos points to the beginning of a slot we need to request a new one to be used
-        let slot_position = if (tx_pos as usize & VCHIQ_SLOT_MASK) == 0 {
+        let slot_position = if (tx_pos & VCHIQ_SLOT_MASK) == 0 {
             // we should never grow beyound the number of slots configured to be available for the ARM side
-            assert!(tx_pos != state.slot_queue_available * VCHIQ_SLOT_SIZE as u32);
+            assert!(tx_pos != self.slot_queue_available * VCHIQ_SLOT_SIZE);
 
             /*
             // Slot availability is signaled with a semaphore, so check if there is one available
@@ -675,7 +949,7 @@ impl StateInner {
                     tx_pos
                 );
 
-                if !is_blocking {
+                if !block {
                     // if it is not requested to wait for the next free slot return to the caller that there was
                     // nothing available - this will also release the lock of the state
                     return Err(GenericError::with_message("no slots available").into());
@@ -700,9 +974,9 @@ impl StateInner {
             // getting here we know we have a Slot we are allowed to use so calculate the index and
             // offset into this slot where the message will be stored, the masking of the index ensures
             // a cirular queue usage
-            let slot_queue_index =
-                slot_queue_index_from_pos(tx_pos as usize) & VCHIQ_SLOT_QUEUE_MASK;
-            let slot_index = state.slot_zero.local_ref().slot_queue()[slot_queue_index] as usize;
+            let slot_queue_index = slot_queue_index_from_pos(tx_pos) & VCHIQ_SLOT_QUEUE_MASK;
+            let slot_index =
+                slot_state.slot_zero.local_ref().slot_queue()[slot_queue_index] as usize;
 
             SlotPosition::new(slot_index, 0)
         } else {
@@ -711,15 +985,15 @@ impl StateInner {
             // be used as this is an implementation error! As the first path should go to the upper part of this
             // if-statement
             SlotPosition::new(
-                state.tx_data.unwrap().index(),
-                tx_pos as usize & VCHIQ_SLOT_MASK,
+                slot_state.tx_data.unwrap().index(),
+                tx_pos & VCHIQ_SLOT_MASK,
             )
         };
 
         // as we now know the new slot position the message can be stored, update the corresponding
         // state values
-        state.local_tx_pos = tx_pos + space_needed as u32;
-        state.tx_data.replace(slot_position);
+        slot_state.local_tx_pos = tx_pos + space_needed;
+        slot_state.tx_data.replace(slot_position);
 
         info!(
             "Space reserved at {:#?} with size {}",
@@ -729,215 +1003,45 @@ impl StateInner {
         Ok(slot_position)
     }
 
-    fn service_from_handle(&self, srvhandle: ServiceHandle) -> Option<&Service> {
-        let service = self.services
+    pub(crate) fn service_by_port(&self, local_port: u32) -> Option<Arc<RefCell<Service>>> {
+        let srv_state = self.srv_state.read();
+        let service = srv_state.services[local_port as usize].as_ref();
+        if let Some(service) = service {
+            if service.borrow().srvstate == ServiceState::FREE {
+                return None;
+            } else {
+                return Some(Arc::clone(service));
+            }
+        }
+
+        None
+    }
+
+    fn service_from_handle(&self, srvhandle: ServiceHandle) -> VchiqResult<Arc<RefCell<Service>>> {
+        let srv_state = self.srv_state.read();
+        let service = srv_state
+            .services
             .iter()
             .find(|&service| {
                 match service {
-                    Some(Service { handle: srvhandle, ..}) => true,
+                    Some(srv) if srv.borrow().handle == srvhandle => true,
+                    //Some(Service { handle: srvhandle, ..}) => true,
                     _ => false,
                 }
-            });
+            })
+            .map(|srv| srv.as_ref())
+            .flatten()
+            .map(|srv| Arc::clone(srv));
 
-        service.unwrap_or(&None).as_ref()
-    }
-
-    fn service_by_port(&self, local_port: u32) -> Option<&Service> {
-        let service = self.services[local_port as usize].as_ref();
-        if let Some(service) = service {
-            if let ServiceState::FREE = service.srvstate {
-                return None;
-            } else {
-                return Some(service);
-            }
-        }
-
-        None
-    }
-
-    fn service_by_port_mut(&mut self, local_port: u32) -> Option<&mut Service> {
-        let service = self.services[local_port as usize].as_mut();
-        if let Some(service) = service {
-            if let ServiceState::FREE = service.srvstate {
-                return None;
-            } else {
-                return Some(service);
-            }
-        }
-
-        None
-    }
-
-    fn parse_rx_slots(&mut self, outer: &State) {
-        let tx_pos = self.slot_zero.remote_ref().tx_pos() as u32;
-        //info!("current rx_pos {:?} - remote tx_pos {:?}", state.rx_pos, tx_pos);
-
-        while self.rx_pos != tx_pos {
-            // if the states rx data does not point to anything means there is no open previous messages that needs
-            // to be processed further with this package
-            if self.rx_data.is_none() {
-                let slot_queue_index =
-                    slot_queue_index_from_pos(tx_pos as usize) as usize & VCHIQ_SLOT_QUEUE_MASK;
-                info!("slot_queue_index {}", slot_queue_index);
-                let slot_index =
-                    self.slot_zero.remote_ref().slot_queue()[slot_queue_index] as usize;
-                info!("slot_index {}", slot_index);
-                self.rx_data.replace(SlotPosition::new(slot_index, 0));
-                //state.rx_info = state.slot_info_from_index(slot_index);
-                /*if let Some(slot_info) = state.slot_infos.get_mut(slot_index as usize) {
-                    (*slot_info).use_count = 1;
-                    (*slot_info).release_count = 0;
-                }*/
-            }
-
-            info!("handle message from {:?}", self.rx_data);
-            if let Some(rx_data) = self.rx_data {
-                let slot_data = self.slot_data.read_message(rx_data);
-
-                let msg_type = msg_type_from_id(slot_data.header.msgid);
-                let local_port = dst_port_from_id(slot_data.header.msgid);
-                let remote_port = src_port_from_id(slot_data.header.msgid);
-                let size = slot_data.header.size;
-                info!(
-                    "slot header - message type {:#?} / size {:#x?}",
-                    msg_type, size
-                );
-
-                // get the service the message is realted to
-                let service = match msg_type {
-                    MessageType::CLOSE => {
-                        let service = self.service_by_port_mut(local_port);
-                        if let Some(service) = &service {
-                            if service.remoteport != remote_port &&
-                               service.remoteport != VCHIQ_PORT_FREE &&
-                               local_port == 0 {
-                                // if this is a CLOSE from a client which hadn't yet received the OPENACK
-                                // we need to look for connected service
-                                todo!();
-                            }
-                        } else {
-                            // if this is a CLOSE from a client which hadn't yet received the OPENACK
-                            // we need to look for connected service
-                            todo!();
-                        }
-                        
-                        service
-                    },
-                    MessageType::OPENACK
-                    | MessageType::DATA
-                    | MessageType::BULK_RX
-                    | MessageType::BULK_TX
-                    | MessageType::BULK_RX_DONE
-                    | MessageType::BULK_TX_DONE => {
-                        let service = self.service_by_port_mut(local_port);
-                        if service.is_none() {
-                            // we need to skip processing here and just advance the position in the 
-                            // slot...
-                            todo!()
-                        }
-
-                        service
-                    }
-                    _ => None,
-                };
-
-                // check for header being to big for a slot
-                // TODO!
-
-                match msg_type {
-                    MessageType::OPEN => unimplemented!(),
-                    MessageType::OPENACK => {
-                        let service = service.expect("OPENACK expects a service to be available");
-                        let message: Result<OpenAckPayload, _> = slot_data.try_into();
-                        if let Ok(msg) = message {
-                            info!("Message: {:?}", msg);
-                            service.peer_version = msg.version;
-                        }
-
-                        if service.srvstate == ServiceState::OPENING {
-                            service.remoteport = remote_port;
-                            service.set_state(ServiceState::OPEN);
-                            service.remove_event.up();
-                        }
-                    },
-                    MessageType::CLOSE => unimplemented!(),
-                    MessageType::DATA => unimplemented!(),
-                    MessageType::CONNECT => {
-                        info!("CONNECT - version common {}", self.slot_zero.version());
-                        // set the connect semaphore which is checked while connecting
-                        // to the VCHIQ - see VchiqInstance::connect()
-                        outer.connect.up();
-                    }
-                    MessageType::BULK_RX | MessageType::BULK_TX => unimplemented!(),
-                    MessageType::BULK_RX_DONE | MessageType::BULK_TX_DONE => {}
-                    MessageType::PADDING => info!("just padding..."),
-                    MessageType::PAUSE => unimplemented!(),
-                    MessageType::RESUME => unimplemented!(),
-                    MessageType::REMOTE_USE => unimplemented!(),
-                    MessageType::REMOTE_RELEASE => unimplemented!(),
-                    MessageType::REMOTE_USE_ACTIVE => unimplemented!(),
-                    //_ => warn!("invalid message type {:#?}", msg_type),
-                }
-
-                let msg_stride = calc_msg_stride(size as usize);
-                let idx = rx_data.index();
-                let offset = rx_data.offset() + msg_stride;
-
-                self.rx_pos += msg_stride as u32;
-
-                if (self.rx_pos as usize & VCHIQ_SLOT_MASK) == 0 {
-                    // release_slot()
-                    let _ = self.rx_data.take();
-                } else {
-                    self.rx_data.replace(SlotPosition::new(idx, offset));
-                }
-                info!("new rx_pos {:?}", self.rx_pos);
-            }
-        }
+        service.ok_or(VchiqError::ServiceNotFound(srvhandle).into())
     }
 }
 
-impl Drop for StateInner {
+impl Drop for State {
     fn drop(&mut self) {
-        info!("release shared memory {:#x}", self.shm_ptr as usize);
-        unsafe { dealloc(self.shm_ptr, self.shm_ptr_layout) };
+        info!("drop state");
+        let ptr = (self.shm_ptr_phys as usize) & !0xC000_0000;
+        info!("release shared memory {:#x}", ptr);
+        unsafe { dealloc(ptr as *mut u8, self.shm_ptr_layout) };
     }
 }
-
-/*
-pub struct StateWaitOpenServiceFuture {
-    state: Arc<AsyncMutex<StateInner>>,
-    srv_handle: ServiceHandle,
-}
-
-impl StateWaitOpenServiceFuture {
-    fn new(state: Arc<AsyncMutex<StateInner>>, srv_handle: ServiceHandle) -> Self {
-        Self {
-            state,
-            srv_handle,
-        }
-    }
-}
-
-impl Future for StateWaitOpenServiceFuture {
-    type Output = ServiceState;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // check if we can lock the state
-        match Box::pin(self.state.lock()).as_mut().poll(cx) {
-            // locking the state successfull, now check for the service state
-            Poll::Ready(mut state) => {
-                let service = state.service_from_handle(self.srv_handle).unwrap();
-                if service.remove_event.try_down().is_ok() {
-                    Poll::Ready(service.srvstate)
-                } else {
-                    //info!("wake wait open service");
-                    cx.waker().wake_by_ref(); // the Future need to be woken
-                    Poll::Pending
-                }
-            }
-            Poll::Pending => Poll::Pending, // if the lock provides pending the lock will wake this future
-        }
-    }
-}
-*/

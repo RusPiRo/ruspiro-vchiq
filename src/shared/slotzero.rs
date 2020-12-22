@@ -14,9 +14,9 @@ use super::event::{LocalEvent, RemoteEvent};
 use super::sharedstate::{DebugInfo, SharedState, SharedStateAccessor};
 use super::slotinfo::{SlotInfo, SlotInfoAccessor};
 use super::FourCC;
-use ruspiro_lock::sync::Semaphore;
 use crate::config::*;
 use ruspiro_console::*;
+use ruspiro_lock::sync::Semaphore;
 
 /// The [SlotZero] has to have the 100% same layout and memory footprint as expected by the VideoCore. Access to parts
 /// of the data can only be given with the respective accessor to ensure the data is properly updated in the shared

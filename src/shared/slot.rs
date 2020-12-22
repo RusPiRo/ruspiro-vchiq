@@ -10,11 +10,11 @@
 //! A generic Slot in the VCHIQ interface to store arbitrary data. Most likely the messages passed between
 //! ARM and VideoCore
 //!
+use crate::config::*;
+use crate::shared::slotmessage::{SlotMessage, SlotMessageHeader};
 use alloc::vec::Vec;
 use core::{mem, ptr, slice};
 use ruspiro_console::info;
-use crate::config::*;
-use crate::shared::slotmessage::{SlotMessage, SlotMessageHeader};
 
 /// The generic [Slot] which memory region is shared between ARM and VideoCore.
 /// It's data layout and size need to 100% match the expected VideoCore format. A [Slot] is typically a container that
@@ -74,12 +74,10 @@ impl SlotAccessor {
 
     /// Store a message in the raw slot data pointed to by the current SlotAccessor
     /// The closure passed to this function retrieves a mutable borrow to the message to be changed
-    pub fn store_message<T, F>(
-        &mut self,
-        slot_pos: SlotPosition,
-        f: F,
-    )  where T: core::fmt::Debug,
-             F: FnOnce(&mut SlotMessage<T>)
+    pub fn store_message<T, F>(&mut self, slot_pos: SlotPosition, f: F)
+    where
+        T: core::fmt::Debug,
+        F: FnOnce(&mut SlotMessage<T>),
     {
         assert!(slot_pos.0 > 0);
         assert!((slot_pos.0 as usize) < self.len);
