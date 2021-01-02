@@ -34,3 +34,6 @@ pub const VCHIQ_SLOT_ZERO_SLOTS: usize =
     (mem::size_of::<SlotZero>() + VCHIQ_SLOT_SIZE - 1) / VCHIQ_SLOT_SIZE;
 /// Total number of [Slot]s we are about to allocate for the interface
 pub const TOTAL_SLOTS: usize = VCHIQ_SLOT_ZERO_SLOTS + 2 * 32;
+
+pub const MAX_COMPLETIONS: usize = 128;
+pub const MSG_QUEUE_SIZE: usize = 128;

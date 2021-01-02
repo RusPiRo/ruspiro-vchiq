@@ -8,7 +8,7 @@
 //! # VCHIQ Event
 //!
 
-use crate::doorbell::ring_vc_doorbell;
+use crate::vchiq::doorbell::ring_vc_doorbell;
 use alloc::format;
 use core::fmt;
 use core::future::Future;

@@ -5,55 +5,48 @@
  * License: Apache License 2.0
  **********************************************************************************************************************/
 
-//! # VCHIQ Instance/Client
+//! # VCHIQ Instance
 //!
-use super::config::*;
-use super::error::VchiqError;
-use super::service::*;
-use super::shared::slotmessage::*;
-use super::slothandler::slot_handler;
-use super::completionhandler::completion_handler;
-use super::state::State;
-use super::VchiqResult;
-use crate::{doorbell, service};
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::future::{poll_fn, Future};
-use core::task::Poll;
+
+mod completion;
+
+use super::{
+    config::{MAX_COMPLETIONS, MSG_QUEUE_SIZE},
+    error::{VchiqError, VchiqResult},
+    service::{Service, ServiceCompletion, ServiceState, ServiceUser},
+    shared::slotmessage::{make_msg_id, MessageType, SlotMessage},
+    slothandler::slot_handler,
+    state::State,
+};
+use crate::types::{Reason, ServiceHandle, ServiceParams, UserData};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use completion::Completion;
+use core::{
+    cell::RefCell,
+    convert::{TryFrom, TryInto},
+    fmt::Debug,
+    future::poll_fn,
+    task::Poll,
+};
 use ruspiro_brain::spawn;
 use ruspiro_console::*;
-use ruspiro_error::{BoxError, Error, GenericError};
-use ruspiro_lock::RWLock;
-use ruspiro_lock::Semaphore;
+use ruspiro_error::GenericError;
+use ruspiro_lock::{RWLock, Semaphore};
 
-pub struct VchiqInstance {
-    state: Arc<State>,
+pub(crate) struct Instance {
+    /// The actual internal state of the interface.
+    pub state: Arc<State>,
     /// Flag that indicates if both sides are in a connected state which would allow the usage of Services between ARM
     /// and VideoCore
     connected: Arc<RWLock<bool>>,
 
-    /// The completion data secured with a ReadWrite Lock
+    /// completion data
     completion: Arc<RWLock<Completion>>,
 }
 
-struct Completion {
-    completion_insert: usize,
-    completion_remove: usize,
-    insert_event: Semaphore,
-    remove_event: Semaphore,
-    /// The list of completions is updated in linux at two places:
-    /// The "service_callback" adds items with the corresponding service and message to this queue
-    /// while the "await_completion" removes them.
-    /// The list is initialized with a fixed length and treated as "ring-buffer"
-    completions: Vec<Option<ServiceCompletion>>,
-}
-
-impl VchiqInstance {
-    /// Create a new VCHIQ instance.
-    pub fn new() -> VchiqResult<Arc<Self>> {
-        info!("create VchiqInstance");
+impl Instance {
+    pub(crate) fn new() -> VchiqResult<Arc<Self>> {
+        info!("create the VCHIQ Instance");
         let mut state = State::new()?;
         state.initialize()?;
         let state = Arc::new(state);
@@ -61,24 +54,17 @@ impl VchiqInstance {
         // as this should be cleaned up once the VCHIQ instance is dropped. Otherwise
         // this would never finish. Or we need to establish a channel between this instance
         // and the slothandler future to notify it to be stopped
+        // in the current design the VCHI API is a singleton that instantiates this once. The singleton lives
+        // as long as the RPi is powered so the clean-up usecase can be deferred for the time beeing
         let state_clone = Arc::clone(&state);
-        spawn(
-            poll_fn(move |cx| slot_handler(Arc::clone(&state_clone), cx))
-        );
-
-        let mut completions = Vec::with_capacity(MAX_COMPLETIONS);
-        completions.resize_with(MAX_COMPLETIONS, Default::default);
+        spawn(poll_fn(move |cx| {
+            slot_handler(Arc::clone(&state_clone), cx)
+        }));
 
         Ok(Arc::new(Self {
             state,
             connected: Arc::new(RWLock::new(false)),
-            completion: Arc::new(RWLock::new(Completion {
-                completion_insert: 0,
-                completion_remove: 0,
-                insert_event: Semaphore::new(0),
-                remove_event: Semaphore::new(0),
-                completions,
-            })),
+            completion: Arc::new(RWLock::new(Completion::default())),
         }))
     }
 
@@ -93,36 +79,21 @@ impl VchiqInstance {
         self.state.connect().await?;
         *self.connected.lock() = true;
 
-        // once we are connected we spawn a thought that will check for completed service messages sent to the VCHIQ
-        // and invoke it's corresponding callbacks. In linux this runs in the user_mode side to invoke the user_mode
-        // callbacks
-        let self_clone = Arc::clone(self);
-        spawn(poll_fn::<(), _>(move |cx| completion_handler(Arc::clone(&self_clone), cx))
-        );
-
         Ok(())
     }
 
-    /// Open a service between the ARM and the VideoCore side. A service is representing a specific "device" or function
-    /// of the VideoCore.
-    pub async fn open_service(
-        self: &Arc<Self>,
-        params: ServiceParams,
-    ) -> VchiqResult<ServiceHandle> {
-        if *self.connected.read() {
-            self.create_service(params, true).await
-        } else {
-            Err(VchiqError::NotConnected.into())
-        }
-    }
-
     pub async fn create_service(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         params: ServiceParams,
         open: bool, // this might be always true as we are always the "client" side and thus open the service
-                    // only the VC side beeing the "server" would set the service to "LISTEN"
+        // only the VC side beeing the "server" would set the service to "LISTEN"
+        vchi: bool,
     ) -> VchiqResult<ServiceHandle> {
         let srv_state = if open {
+            // the instance is required to be connected before we can create a service
+            if !*self.connected.read() {
+                return Err(VchiqError::NotConnected.into());
+            }
             ServiceState::OPENING
         } else {
             if *self.connected.read() {
@@ -138,11 +109,40 @@ impl VchiqInstance {
         // it's callback - but this await is not called service specific - maybe a dequeue_message would be a better fit
         // This is not yet clear how this works finally together - currently focussing on how the vchi-tests are
         // implemented and trying to get them to run successfully!
-        let completions = Arc::clone(&self.completion);
+        let completion = Arc::clone(&self.completion);
+        // create a user_service instance
+        // store the original userdata inside this instance and pass the user_service
+        // as user_data to the service addition
+        let mut msg_queue = Vec::with_capacity(MSG_QUEUE_SIZE);
+        msg_queue.resize_with(MSG_QUEUE_SIZE, Default::default);
+        let user_service = ServiceUser {
+            userdata: params.userdata,
+            is_vchi: vchi,
+            dequeue_pending: false,
+            close_pending: false,
+            message_available_pos: -1, //instance.completion_remove - 1
+            msg_insert: 0,
+            msg_remove: 0,
+            insert_event: Semaphore::new(0),
+            remove_event: Semaphore::new(0),
+            close_event: Semaphore::new(0),
+            msg_queue,
+        };
+        let this = Arc::clone(&self);
         let params = ServiceParams {
-            callback: Some(Box::new(move |service, reason, message| {
-                service_callback(service, Arc::clone(&completions), reason, message);
-            })),
+            callback: Some(Arc::new(
+                move |reason, message, srv_handle, bulk_userdata| {
+                    let service = this.state.service_from_handle(srv_handle).unwrap();
+                    service_callback(
+                        reason,
+                        message,
+                        bulk_userdata,
+                        service,
+                        Arc::clone(&completion),
+                    );
+                },
+            )),
+            userdata: Some(UserData::new(user_service)),
             ..params
         };
         let srv_handle = self.state.add_service(params, srv_state).await?;
@@ -156,13 +156,12 @@ impl VchiqInstance {
         Ok(srv_handle)
     }
 
-    /// Close a previously opened service
-    pub async fn close_service(self: &Arc<Self>, service: ServiceHandle) -> VchiqResult<()> {
-        self.state.close_service(service).await
+    pub async fn close_service(self: Arc<Self>, service_handle: ServiceHandle) -> VchiqResult<()> {
+        self.state.close_service(service_handle).await
     }
 
     /// Queue a message to the video core
-    pub async fn queue_message<T: core::fmt::Debug>(
+    pub async fn queue_message<T: core::fmt::Debug + Clone>(
         self: &Arc<Self>,
         service: ServiceHandle,
         data: T,
@@ -180,28 +179,37 @@ impl VchiqInstance {
             .await
     }
 
-    pub async fn dequeue_message(
+    /// Dequeue a message means retreiving the results from the VideoCore once the corresponding request to the
+    /// service has been completed. A "client" will typically register a callback to get notified once the VC answered
+    /// to a previous request. Once this callback is invoked the "client" will either signal a semaphore to request the
+    /// result in another thread or directly call the dequeue_message to retrieve the results.
+    /// The dequeue_message can only be called on VCHI services
+    pub async fn dequeue_message<T>(
         self: &Arc<Self>,
         service: ServiceHandle,
         max_data_to_read: usize,
-    ) -> VchiqResult<Vec<u8>> {
+    ) -> VchiqResult<T>
+    where
+        T: Debug + TryFrom<SlotMessage<Vec<u8>>>,
+        <T as TryFrom<SlotMessage<Vec<u8>>>>::Error: Debug,
+    {
         let service = self.state.service_from_handle(service)?;
-        /*
-        service.peek_size  >= 0 {
-            // this will copy the service.peek_buf of service.peek_size to return
-            // the actual data - need to investigate how this data is provided/filled
-            // as this is available in the user space vchi service attributes only
-        }
-        */
-        if !service.borrow().base.userdata.is_vchi {
-            return Err(
-                GenericError::with_message("called dequeue for is_vchi = false service").into(),
-            );
+        let user_data = service.borrow().base.userdata.as_ref().unwrap().clone();
+        {
+            let user_data = user_data.read();
+            let user_service = user_data.downcast_ref::<ServiceUser>().unwrap();
+
+            if !user_service.is_vchi {
+                return Err(GenericError::with_message(
+                    "called dequeue for a service that is not marked as vchi",
+                )
+                .into());
+            }
         }
 
         poll_fn(|cx| {
-            let mut service = service.borrow_mut();
-            let user_service = &mut service.base.userdata;
+            let mut user_data = user_data.lock();
+            let user_service = user_data.downcast_mut::<ServiceUser>().unwrap();
             if user_service.msg_remove == user_service.msg_insert {
                 user_service.dequeue_pending = true;
                 // now wait until data has been inserted into the service msg_queue
@@ -219,8 +227,9 @@ impl VchiqInstance {
         })
         .await;
 
-        let mut service = service.borrow_mut();
-        let user_service = &mut service.base.userdata;
+        let mut user_data = user_data.lock();
+        let user_service = user_data.downcast_mut::<ServiceUser>().unwrap();
+
         if user_service.msg_remove > user_service.msg_insert {
             return Err(GenericError::with_message("user service msg_remove > msg_insert").into());
         }
@@ -233,7 +242,7 @@ impl VchiqInstance {
             .unwrap()
             .take()
             .unwrap();
-        let result = message.data.clone(); //.iter().map(|v| *v).collect::<Vec<u8>>();
+        let result = (*message).clone().try_into().unwrap(); //.map_err(|e| GenericError::with_message("unable to convert message").into())?;
         user_service.remove_event.up();
 
         // TODO: release_message(service_handle, message);
@@ -241,67 +250,9 @@ impl VchiqInstance {
         Ok(result)
     }
 
-    pub fn set_service_option(
-        self: &Arc<Self>,
-        service: ServiceHandle,
-        option: ServiceOption,
-        value: i32,
-    ) -> VchiqResult<()> {
-        let service = self.state.service_from_handle(service)?;
-        let mut service = service.borrow_mut();
-        match option {
-            ServiceOption::AUTOCLOSE => service.auto_close = value != 0,
-            ServiceOption::SLOT_QUOTA => {
-                let mut quota_state = self.state.quota_state.lock();
-                let srv_quota = quota_state
-                    .service_quotas
-                    .get_mut(service.localport as usize)
-                    .unwrap();
-                let value = if value == 0 {
-                    self.state.default_slot_quota
-                } else {
-                    value as usize
-                };
-                if value >= srv_quota.slot_use_count && value < usize::MAX {
-                    srv_quota.slot_quota = value;
-                    if srv_quota.message_quota >= srv_quota.message_use_count {
-                        // signal the service it may have dropped below its quota
-                        srv_quota.quota_event.up();
-                    }
-                }
-            }
-            ServiceOption::MESSAGE_QUOTA => {
-                let mut quota_state = self.state.quota_state.lock();
-                let srv_quota = quota_state
-                    .service_quotas
-                    .get_mut(service.localport as usize)
-                    .unwrap();
-                let value = if value == 0 {
-                    self.state.default_message_quota
-                } else {
-                    value as usize
-                };
-                if value >= srv_quota.message_use_count && value < usize::MAX {
-                    srv_quota.message_quota = value;
-                    if srv_quota.slot_quota >= srv_quota.slot_use_count {
-                        // signal the service it may have dropped below its quota
-                        srv_quota.quota_event.up();
-                    }
-                }
-            }
-            ServiceOption::SYNCHRONOUS => {
-                if service.srvstate == ServiceState::HIDDEN
-                    || service.srvstate == ServiceState::LISTENING
-                {
-                    service.sync = value != 0;
-                }
-            }
-            ServiceOption::TRACE => service.trace = value != 0,
-        }
-
-        Ok(())
-    }
-
+    /// Wait until we've received the completion of a service request to the VideoCore.
+    /// The completion list is filled from the "service_callback" that is invoked for all
+    /// vchi services when a DATA message is received and handled in the "slothandler".
     pub async fn await_completion(
         self: &Arc<Self>,
         count: usize,
@@ -341,6 +292,7 @@ impl VchiqInstance {
                 .take()
                 .unwrap();
             // now we have the actual completion record
+            // TODO: do we really need to do the following?
             // grab the user service data from the service packet into the completion userdata
             // completion.srv_userdata = ((completion.srv_userdata as Service).base.userdata as ServiceUser).userdata;
 
@@ -355,24 +307,23 @@ impl VchiqInstance {
     }
 }
 
-impl Drop for VchiqInstance {
-    fn drop(&mut self) {
-        info!("dropping VCHIQ");
-    }
-}
-
 fn service_callback(
+    reason: Reason,
+    message: Option<Arc<SlotMessage<Vec<u8>>>>,
+    bulk_userdata: Option<()>,
     service: Arc<RefCell<Service>>,
-    completions: Arc<RWLock<Completion>>,
-    reason: CallbackReason,
-    message: SlotMessage<Vec<u8>>,
+    completion: Arc<RWLock<Completion>>,
 ) -> VchiqResult<()> {
     info!("internal service callback called with reason {:?}", reason);
     let mut skip_completion = false;
-    let user_service = &mut service.borrow_mut().base.userdata;
+    let service = service.borrow();
+    let mut user_data = service.base.userdata.as_ref().unwrap().lock();
+    let mut user_service = user_data.downcast_mut::<ServiceUser>().unwrap();
+
     let message = Arc::new(message);
     if user_service.is_vchi {
-        // TODO: there might be no message when the callback is called? In this case the message should be an Option!
+        // TODO: there might be no message when the callback is called? In this case the message should be an
+        // Option!
         //if let Some(message) = message {
         // TODO: loop as long as this is true but in an async fashion, requires
         // the whole callback to be async!
@@ -380,9 +331,9 @@ fn service_callback(
             info!("service_callback - message queue is full");
             // if there is no MESSAGE_AVAILABLE entry in the completion queue,
             // add one:
-            if user_service.message_available_pos < completions.read().completion_remove as isize {
+            if user_service.message_available_pos < completion.read().completion_remove as isize {
                 info!("inserting an extra MESSAGE_AVAILABLE into completio queue");
-                add_completion(Arc::clone(&completions), reason, None, user_service);
+                completion.lock().add_completion(reason, None, user_service);
             }
 
             if user_service.remove_event.try_down().is_err() {
@@ -391,16 +342,15 @@ fn service_callback(
             // Poll::Ready
         }
         let msg_insert = user_service.msg_insert;
-        user_service
+        *user_service
             .msg_queue
             .get_mut(msg_insert & (MSG_QUEUE_SIZE - 1))
-            .unwrap()
-            .replace(Arc::clone(&message));
+            .unwrap() = (*message).as_ref().map(|m| Arc::clone(&m));
         user_service.msg_insert += 1;
 
         // if there is another "thread" waiting in DEQUEUE_MESSAGE, or if there is a MESSAGE_AVAILABLE in the
         // completion queue then bypass a further addition to the completion queue
-        if user_service.message_available_pos >= completions.read().completion_remove as isize
+        if user_service.message_available_pos >= completion.read().completion_remove as isize
             || user_service.dequeue_pending
         {
             user_service.dequeue_pending = false;
@@ -416,10 +366,9 @@ fn service_callback(
         info!("add completion");
         // add this data to the completion list if not already done
         // but this time add the message to the completion
-        add_completion(
-            Arc::clone(&completions),
+        completion.lock().add_completion(
             reason,
-            Some(Arc::clone(&message)),
+            (*message).as_ref().map(|m| Arc::clone(m)),
             user_service,
         );
     }
@@ -427,9 +376,10 @@ fn service_callback(
     Ok(())
 }
 
+/*
 fn add_completion(
     completions: Arc<RWLock<Completion>>,
-    reason: CallbackReason,
+    reason: Reason,
     message: Option<Arc<SlotMessage<Vec<u8>>>>,
     user_service: &mut ServiceUser,
 ) {
@@ -472,7 +422,7 @@ fn add_completion(
     // do we need a memory barrier here?
     // dmb();
 
-    if reason == CallbackReason::MESSAGE_AVAILABLE {
+    if reason == Reason::MESSAGE_AVAILABLE {
         user_service.message_available_pos = insert as isize;
     }
 
@@ -481,3 +431,4 @@ fn add_completion(
 
     completions.insert_event.up();
 }
+*/

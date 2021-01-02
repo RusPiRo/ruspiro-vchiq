@@ -11,7 +11,7 @@
 use core::fmt;
 
 use super::event::{Event, EventAccessor};
-use crate::config::*;
+use crate::vchiq::config::*;
 
 #[allow(non_camel_case_types, dead_code)]
 #[derive(Debug)]

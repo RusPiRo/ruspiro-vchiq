@@ -200,8 +200,6 @@ dependencies = [
 [[package]]
 name = "ruspiro-singleton"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61bd3a4a30e7c61eb6d20c5cce79823c594ebb6189c761ea470b56d21a373fb5"
 dependencies = [
  "ruspiro-lock 0.4.1",
 ]

@@ -7,19 +7,26 @@
 
 //! # VCHIQ SlotHandler
 //!
-use super::config::*;
-use super::service::{ServiceState, VCHIQ_PORT_FREE};
-use super::shared::slot::{slot_queue_index_from_pos, SlotPosition};
-use super::shared::slotmessage::*;
-use super::shared::slotmessage::{calc_msg_stride, msg_type_from_id, MessageType};
-use super::state::State;
-use crate::{service, state};
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use core::convert::TryInto;
-use core::future::{Future, Pending};
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use super::{
+    config::*,
+    service::{Service, ServiceState, VCHIQ_PORT_FREE},
+    shared::{
+        slot::{slot_queue_index_from_pos, SlotPosition},
+        slotmessage::{
+            calc_msg_stride, dst_port_from_id, msg_type_from_id, src_port_from_id, MessageType,
+            OpenAckPayload,
+        },
+    },
+    state::State,
+};
+use crate::types::Reason;
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    convert::TryInto,
+    future::{Future, Pending},
+    pin::Pin,
+    task::{Context, Poll},
+};
 use ruspiro_console::*;
 use ruspiro_lock::r#async::AsyncMutexGuard;
 
@@ -144,7 +151,7 @@ pub(crate) fn slot_handler(state: Arc<State>, cx: &mut Context<'_>) -> Poll<()> 
                             ServiceState::CLOSESENT => {
                                 // TODO: do_abort_bulks
 
-                                state.close_service_complete(
+                                let _ = state.close_service_complete(
                                     Arc::clone(&service),
                                     ServiceState::CLOSERECVD,
                                 );
@@ -154,7 +161,39 @@ pub(crate) fn slot_handler(state: Arc<State>, cx: &mut Context<'_>) -> Poll<()> 
                             _ => warn!("close recieved for service in state {:?}", srvstate),
                         }
                     }
-                    MessageType::DATA => unimplemented!(),
+                    MessageType::DATA => {
+                        let service = service.expect("DATA expects a service to be available");
+                        info!(
+                            "DATA Message local/remote {}/{} - srv.local/remote {}/{}",
+                            local_port,
+                            remote_port,
+                            service.borrow().localport,
+                            service.borrow().remoteport,
+                        );
+                        if service.borrow().remoteport == remote_port
+                            && service.borrow().srvstate == ServiceState::OPEN
+                        {
+                            // header->msg_id = msgid | MSGID_CLAIMED;
+                            // claim_slot(slot_state.rx_info);
+                            // now invoke the service callback passing the actuall received data to it
+                            info!(
+                                "data received for service, invoke callback with {:?}",
+                                slot_data
+                            );
+                            let service_clone = Arc::clone(&service);
+                            let callback = service.borrow_mut().base.callback.take();
+                            let srv_handle = service.borrow().handle;
+                            if let Some(callback) = callback {
+                                (callback)(
+                                    Reason::MESSAGE_AVAILABLE,
+                                    Some(Arc::new(slot_data)),
+                                    srv_handle,
+                                    None,
+                                );
+                                service.borrow_mut().base.callback.replace(callback);
+                            };
+                        }
+                    }
                     MessageType::CONNECT => {
                         info!(
                             "CONNECT - version common {}",

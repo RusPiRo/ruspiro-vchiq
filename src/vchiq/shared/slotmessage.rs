@@ -9,7 +9,10 @@
 //!
 
 use alloc::vec::Vec;
-use core::mem;
+use core::{
+    convert::{From, TryFrom},
+    fmt, mem,
+};
 use ruspiro_error::{BoxError, Error, GenericError};
 
 /// The message ID of a padding message
@@ -17,18 +20,28 @@ pub const VCHIQ_MSGID_PADDING: u32 = make_msg_id(MessageType::PADDING, 0, 0);
 
 /// A message that is stored within the [Slot]. Access to the message is only available through the [SlotAccessor]
 /// functions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(C)]
-pub struct SlotMessage<T: core::fmt::Debug> {
+pub struct SlotMessage<T: fmt::Debug + Clone> {
     pub header: SlotMessageHeader,
     pub data: T,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 #[repr(C)]
 pub struct SlotMessageHeader {
     pub msgid: u32,
     pub size: u32,
+}
+
+impl fmt::Debug for SlotMessageHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotMessageHeader")
+            .field("msgid -> msg_type", &msg_type_from_id(self.msgid))
+            .field("msgid -> localport", &dst_port_from_id(self.msgid))
+            .field("msgid -> remoteport", &src_port_from_id(self.msgid))
+            .finish()
+    }
 }
 
 #[allow(non_camel_case_types, dead_code)]
@@ -52,7 +65,7 @@ pub enum MessageType {
     REMOTE_USE_ACTIVE = 14, /* -                                 */
 }
 
-impl core::convert::From<u32> for MessageType {
+impl From<u32> for MessageType {
     fn from(orig: u32) -> Self {
         match orig {
             0 => MessageType::PADDING,
@@ -80,10 +93,10 @@ pub struct OpenAckPayload {
     pub version: u16,
 }
 
-impl core::convert::TryFrom<SlotMessage<Vec<u8>>> for OpenAckPayload {
+impl TryFrom<SlotMessage<Vec<u8>>> for OpenAckPayload {
     type Error = BoxError;
     fn try_from(message: SlotMessage<Vec<u8>>) -> Result<Self, Self::Error> {
-        if (message.header.size as usize) < core::mem::size_of::<OpenAckPayload>() {
+        if (message.header.size as usize) < mem::size_of::<OpenAckPayload>() {
             Err(GenericError::with_message("unable to convert into OpenAckPayload").into())
         } else {
             //let msg_ptr = &message as *const SlotMessage<Vec<u8>> as *const u8;
@@ -93,6 +106,15 @@ impl core::convert::TryFrom<SlotMessage<Vec<u8>>> for OpenAckPayload {
 
             Ok(data)
         }
+    }
+}
+
+impl TryFrom<SlotMessage<Vec<u8>>> for Vec<u8> {
+    type Error = BoxError;
+    fn try_from(message: SlotMessage<Vec<u8>>) -> Result<Self, Self::Error> {
+        let data = message.data.clone();
+
+        Ok(data)
     }
 }
 

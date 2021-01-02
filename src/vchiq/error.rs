@@ -8,10 +8,13 @@
 //! # VCHIQ Errors
 //!
 
-use crate::service::ServiceHandle;
+use crate::types::ServiceHandle;
 use core::fmt;
 use ruspiro_error::*;
 
+pub type VchiqResult<T> = Result<T, BoxError>;
+
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum VchiqError {
     StateNotInitialized,

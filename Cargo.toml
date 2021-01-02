@@ -35,7 +35,7 @@ ruspiro-mmu = "0.1.0"
 ruspiro-console = "0.4.1"
 ruspiro-uart = { path = "../ruspiro-uart" }
 ruspiro-lock = { version = "0.4.1", features = ["async_locks"] }
-ruspiro-singleton = "0.4.1"
+ruspiro-singleton = { version = "0.4.1", features = ["async"] }
 ruspiro-error = "0.1.0"
 ruspiro-brain = { git = "https://github.com/RusPiRo/ruspiro-brain.git", branch = "development" }
 ruspiro-interrupt = "0.3"
@@ -56,3 +56,4 @@ ruspiro-gpio = { path = "../ruspiro-gpio" }
 ruspiro-boot = { path = "../ruspiro-boot" }
 ruspiro-mmu = { path = "../ruspiro-mmu" }
 ruspiro-lock = { path = "../ruspiro-lock", features = ["async_lock"] }
+ruspiro-singleton = { path = "../ruspiro-singleton" }

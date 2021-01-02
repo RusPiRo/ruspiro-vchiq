@@ -8,26 +8,26 @@
 //! # VCHIQ State
 //!
 
-use super::config::*;
-use super::service::*;
-use super::shared::fragment::Fragment;
-use super::shared::slot::{slot_queue_index_from_pos, Slot, SlotAccessor, SlotPosition};
-use super::shared::slotmessage::*;
-use super::shared::FourCC;
-use crate::{
+use super::{
+    config::*,
     doorbell,
-    error::VchiqError,
-    shared::slotzero::{SlotZero, SlotZeroAccessor},
+    error::{VchiqError, VchiqResult},
+    service::{Service, ServiceBase, ServiceQuota, ServiceState, VCHIQ_PORT_FREE},
+    shared::{
+        fragment::Fragment,
+        slot::{slot_queue_index_from_pos, Slot, SlotAccessor, SlotPosition},
+        slotmessage::*,
+        slotzero::{SlotZero, SlotZeroAccessor},
+    },
 };
-use crate::{
-    service::{self, ServiceState},
-    VchiqResult,
+use crate::types::{FourCC, ServiceHandle, ServiceParams};
+use alloc::{
+    alloc::{alloc, dealloc, Layout},
+    boxed::Box,
+    string::ToString,
+    sync::Arc,
+    vec::Vec,
 };
-use alloc::alloc::{alloc, dealloc, Layout};
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::{
     cell::{RefCell, RefMut},
     cmp,
@@ -126,9 +126,9 @@ pub(crate) struct State {
     unused_service: usize,
     */
     /// default quota for slots
-    default_slot_quota: usize,
+    pub default_slot_quota: usize,
     /// default quota for messages
-    default_message_quota: usize,
+    pub default_message_quota: usize,
     /// Sempahore indicating a connect message has been received
     pub connect: AsyncSemaphore,
     /// Semaphore used to indicate how many slots are available
@@ -136,6 +136,9 @@ pub(crate) struct State {
     slot_remove_event: Semaphore,
     data_quota_event: Semaphore,
 }
+
+unsafe impl Send for State {}
+unsafe impl Sync for State {}
 
 pub(crate) struct SlotState {
     /// Accessor to the [SlotZero] data stored in the shared memory region
@@ -176,6 +179,7 @@ pub(crate) struct SrvState {
     unused_service: usize,
 }
 
+#[allow(dead_code, unused_attributes)]
 impl State {
     /// Create a new State instance. This is creating a specfic memory region that will be shared
     /// between the VideoCore and the ARM as data transfer channel between the two sides. The memory
@@ -374,12 +378,13 @@ impl State {
         srv_state: ServiceState,
     ) -> VchiqResult<ServiceHandle> {
         let mut service = Service::new(srv_params);
-        if let ServiceState::OPENING = srv_state {
+        if srv_state == ServiceState::OPENING {
             service.public_fourcc = None;
         }
 
         let mut srv_index = None;
         let mut service_state = self.srv_state.lock();
+        // we can assume that the requested state will always be OPENING
         if srv_state == ServiceState::OPENING {
             // find the first index with an unused service
             srv_index = service_state.services[..service_state.unused_service as usize]
@@ -390,6 +395,8 @@ impl State {
                     _ => None,
                 });
         } else {
+            unreachable!();
+            /*
             // if the requested state of the service is not "OPENING" then check the list of services in reverse
             // order that there is no service already existing using the same fourCC
             // TODO: implement the verification as in linux, skip this for the time beeing
@@ -401,6 +408,7 @@ impl State {
                     None => Some(idx),
                     _ => None,
                 });
+            */
         }
 
         // if there could not be any free index found, check for the last unused one
@@ -441,7 +449,7 @@ impl State {
     }
 
     pub(crate) async fn open_service(&self, srv_handle: ServiceHandle) -> VchiqResult<()> {
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         struct OpenPayload {
             fourcc: FourCC,
             client_id: i32,
@@ -721,7 +729,7 @@ impl State {
     /// This will mutate:
     /// slot_zero, slot_data, local_tx_pos and tx_data
     /// previous_data_index, data_use_count, service_quotas of one service
-    async fn queue_message<T: core::fmt::Debug>(
+    pub(crate) async fn queue_message<T: core::fmt::Debug + Clone>(
         &self,
         service: Option<Arc<RefCell<Service>>>,
         msg_id: u32,
@@ -1017,7 +1025,10 @@ impl State {
         None
     }
 
-    fn service_from_handle(&self, srvhandle: ServiceHandle) -> VchiqResult<Arc<RefCell<Service>>> {
+    pub(crate) fn service_from_handle(
+        &self,
+        srvhandle: ServiceHandle,
+    ) -> VchiqResult<Arc<RefCell<Service>>> {
         let srv_state = self.srv_state.read();
         let service = srv_state
             .services

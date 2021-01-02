@@ -14,7 +14,7 @@ use super::event::{LocalEvent, RemoteEvent};
 use super::sharedstate::{DebugInfo, SharedState, SharedStateAccessor};
 use super::slotinfo::{SlotInfo, SlotInfoAccessor};
 use super::FourCC;
-use crate::config::*;
+use crate::vchiq::config::*;
 use ruspiro_console::*;
 use ruspiro_lock::sync::Semaphore;
 
